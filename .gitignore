@@ -1,0 +1,11 @@
+config.json
+models/
+recordings/*
+!recordings/.gitkeep
+transcripts/*
+!transcripts/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+.idea/
+callscribe_plan.md

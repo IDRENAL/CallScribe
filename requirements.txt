@@ -1,0 +1,17 @@
+# Аудио захват
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Определение физических ядер CPU
+psutil>=5.9.0
+
+# Speech-to-Text
+faster-whisper>=1.0.0
+
+# Веб-интерфейс
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# --- Опционально: GPU ускорение ---
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Модель large-v3 скачается автоматически (~3 GB) при первом запуске

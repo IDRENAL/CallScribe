@@ -1,0 +1,302 @@
+"""Веб-интерфейс: FastAPI + WebSocket.
+
+WebSocket — только push сервер→браузер (лог, статус, результаты).
+Команды идут обычными HTTP POST.
+"""
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import os
+import subprocess
+import sys
+import threading
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from config import get_paths, load_config
+from recorder import CallRecorder
+from transcriber import Transcriber
+
+BASE = Path(__file__).parent
+TEMPLATES = BASE / "templates"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001
+    manager.loop = asyncio.get_running_loop()
+    sys.stdout = WsLogStream(sys.__stdout__)
+    yield
+    sys.stdout = sys.__stdout__
+
+
+app = FastAPI(title="CallScribe", lifespan=lifespan)
+
+
+# --------------------------------------------------------------------------- #
+#  ConnectionManager
+# --------------------------------------------------------------------------- #
+class ConnectionManager:
+    def __init__(self):
+        self.active: list[WebSocket] = []
+        self.loop: asyncio.AbstractEventLoop | None = None
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        self.active = [c for c in self.active if c is not ws]
+
+    async def broadcast(self, data: dict):
+        dead = []
+        for ws in self.active:
+            try:
+                await ws.send_text(json.dumps(data, ensure_ascii=False))
+            except Exception:  # noqa: BLE001
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+    def broadcast_sync(self, data: dict):
+        """Вызов из обычного (не-async) потока."""
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.broadcast(data), self.loop)
+
+
+manager = ConnectionManager()
+
+
+# --------------------------------------------------------------------------- #
+#  Перехват print() → WebSocket
+# --------------------------------------------------------------------------- #
+class WsLogStream(io.TextIOBase):
+    def __init__(self, original_stream):
+        self.original = original_stream
+
+    def write(self, text: str) -> int:
+        if text.strip():
+            level = ("ok" if text.startswith("✓") else
+                     "err" if text.startswith("✗") else
+                     "warn" if text.startswith("⚠") else "info")
+            manager.broadcast_sync({"type": "log", "text": text.rstrip(), "level": level})
+        self.original.write(text)
+        return len(text)
+
+    def flush(self):
+        self.original.flush()
+
+
+# --------------------------------------------------------------------------- #
+#  Глобальное состояние
+# --------------------------------------------------------------------------- #
+class AppState:
+    recording: bool = False
+    busy: bool = False
+    recorder: CallRecorder | None = None
+    _rec_stop_event: threading.Event | None = None
+    _job_thread: threading.Thread | None = None
+
+
+state = AppState()
+
+
+def _config_and_paths():
+    cfg = load_config()
+    return cfg, get_paths(cfg)
+
+
+# --------------------------------------------------------------------------- #
+#  Routes
+# --------------------------------------------------------------------------- #
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return (TEMPLATES / "index.html").read_text(encoding="utf-8")
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await manager.connect(ws)
+    try:
+        await ws.send_text(json.dumps(
+            {"type": "files", "files": _list_files()}, ensure_ascii=False))
+        while True:
+            await ws.receive_text()  # держим соединение; входящие игнорируем
+    except WebSocketDisconnect:
+        manager.disconnect(ws)
+    except Exception:  # noqa: BLE001
+        manager.disconnect(ws)
+
+
+def _list_files() -> list[dict]:
+    cfg, paths = _config_and_paths()
+    recordings = paths["recordings"]
+    transcripts = paths["transcripts"]
+    files = []
+    for wav in sorted(recordings.glob("call_*.wav"), reverse=True):
+        stem = wav.stem
+        stat = wav.stat()
+        try:
+            dt = datetime.strptime(stem, "call_%Y-%m-%d_%H-%M-%S").strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            dt = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        files.append({
+            "stem": stem,
+            "date": dt,
+            "size_mb": round(stat.st_size / 1024 ** 2, 1),
+            "has_transcript": (transcripts / f"{stem}_transcript.md").exists(),
+            "has_summary": (transcripts / f"{stem}_summary.md").exists(),
+        })
+    return files
+
+
+@app.get("/api/files")
+async def api_files():
+    return JSONResponse(_list_files())
+
+
+@app.get("/api/content")
+async def api_content(type: str, stem: str):  # noqa: A002
+    cfg, paths = _config_and_paths()
+    suffix = "_transcript.md" if type == "transcript" else "_summary.md"
+    path = paths["transcripts"] / f"{stem}{suffix}"
+    if not path.exists():
+        return JSONResponse({"ok": False, "reason": "not_found"})
+    return JSONResponse({"ok": True, "content": path.read_text(encoding="utf-8"),
+                         "content_type": "markdown", "file_path": str(path)})
+
+
+@app.post("/api/record/start")
+async def api_record_start():
+    if state.busy or state.recording:
+        return JSONResponse({"ok": False, "reason": "busy"})
+    cfg, paths = _config_and_paths()
+    state.recording = True
+    stop_event = threading.Event()
+    state._rec_stop_event = stop_event
+    state.recorder = CallRecorder(cfg.get("mic_device"), cfg.get("loopback_device"),
+                                  paths["recordings"])
+
+    def _worker():
+        try:
+            manager.broadcast_sync({"type": "recording_started"})
+            state.recorder.record(stop_event=stop_event)
+        except Exception as e:  # noqa: BLE001
+            manager.broadcast_sync({"type": "job_error", "error": str(e)})
+        finally:
+            state.recording = False
+            manager.broadcast_sync({"type": "recording_stopped"})
+            manager.broadcast_sync({"type": "files", "files": _list_files()})
+
+    t = threading.Thread(target=_worker, daemon=True)
+    state._job_thread = t
+    t.start()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/record/stop")
+async def api_record_stop():
+    if not state.recording or not state.recorder:
+        return JSONResponse({"ok": False, "reason": "not_recording"})
+    state.recorder.stop()
+    return JSONResponse({"ok": True})
+
+
+def _run_job(label: str, fn):
+    """Запустить долгую задачу в фоновом потоке с broadcast-уведомлениями."""
+    if state.busy or state.recording:
+        return JSONResponse({"ok": False, "reason": "busy"})
+    state.busy = True
+
+    def _worker():
+        try:
+            manager.broadcast_sync({"type": "job_started", "label": label})
+            fn()
+            manager.broadcast_sync({"type": "files", "files": _list_files()})
+        except Exception as e:  # noqa: BLE001
+            manager.broadcast_sync({"type": "job_error", "error": str(e)})
+        finally:
+            state.busy = False
+
+    t = threading.Thread(target=_worker, daemon=True)
+    state._job_thread = t
+    t.start()
+    return JSONResponse({"ok": True})
+
+
+def _do_transcribe(stem: str):
+    cfg, paths = _config_and_paths()
+    wav = paths["recordings"] / f"{stem}.wav"
+    if not wav.exists():
+        raise FileNotFoundError(f"Нет файла {wav.name}")
+    tr = Transcriber(paths["transcripts"], paths["models"],
+                     language=cfg.get("language", "ru"),
+                     model_name=cfg.get("whisper_model"))
+    result = tr.transcribe(wav)
+    md = paths["transcripts"] / f"{stem}_transcript.md"
+    manager.broadcast_sync({
+        "type": "job_done", "label": "Транскрипция готова",
+        "content": md.read_text(encoding="utf-8"),
+        "content_type": "transcript", "file_path": str(md)})
+
+
+@app.post("/api/transcribe")
+async def api_transcribe(body: dict):
+    stem = body.get("stem")
+    if not stem:
+        return JSONResponse({"ok": False, "reason": "no_stem"})
+    return _run_job("Транскрипция…", lambda: _do_transcribe(stem))
+
+
+@app.post("/api/process")
+async def api_process(body: dict):
+    # v1.0: process == transcribe (выжимка/LLM — v2.0, см. план)
+    stem = body.get("stem")
+    if not stem:
+        return JSONResponse({"ok": False, "reason": "no_stem"})
+    return _run_job("Обработка…", lambda: _do_transcribe(stem))
+
+
+@app.post("/api/open")
+async def api_open(body: dict):
+    path = body.get("path")
+    if not path or not Path(path).exists():
+        return JSONResponse({"ok": False, "reason": "not_found"})
+    _open_in_system(path)
+    return JSONResponse({"ok": True})
+
+
+def _open_in_system(path: str):
+    if sys.platform == "win32":
+        os.startfile(path)  # noqa: S606
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+# --------------------------------------------------------------------------- #
+#  Запуск
+# --------------------------------------------------------------------------- #
+def run_ui(host: str = "127.0.0.1", port: int = 5000):
+    import webbrowser
+    url = f"http://{host}:{port}"
+
+    def _open():
+        import time
+        time.sleep(1.2)
+        webbrowser.open(url)
+
+    threading.Thread(target=_open, daemon=True).start()
+    print(f"✓ CallScribe UI: {url}")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
+if __name__ == "__main__":
+    run_ui()
