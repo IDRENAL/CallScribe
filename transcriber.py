@@ -208,12 +208,15 @@ def _transcribe_channel(args: tuple) -> dict:
     Запускается в отдельном процессе. offset_sec прибавляется к таймстампам,
     сегментам проставляется speaker. Куски режутся по тишине, слова не теряются.
     """
-    (channel, speaker, wav_path, offset_sec, model_size, language, device,
+    (channel, speaker, wav_path, offset_sec, chunk_dur, model_size, language, device,
      compute_type, models_dir, cpu_threads, vad) = args
 
     os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
     os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
     os.environ["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+
+    if device == "cuda":
+        ensure_cuda_libs()
 
     try:
         from faster_whisper import WhisperModel
@@ -224,11 +227,19 @@ def _transcribe_channel(args: tuple) -> dict:
             wav_path, language=language,
             vad_filter=vad, vad_parameters=ACCURATE_VAD_PARAMS, **ACCURATE_OPTS)
 
-        segments = [
-            {"start": seg.start + offset_sec, "end": seg.end + offset_sec,
-             "text": seg.text.strip(), "speaker": speaker, "channel": channel}
-            for seg in segments_gen
-        ]
+        # Стриминг прогресса для длинных кусков (один проход на GPU был «слепым»)
+        segments = []
+        last_pct = -10
+        for seg in segments_gen:
+            segments.append(
+                {"start": seg.start + offset_sec, "end": seg.end + offset_sec,
+                 "text": seg.text.strip(), "speaker": speaker, "channel": channel})
+            if chunk_dur > 120:
+                pct = min(99, int(seg.end / chunk_dur * 100))
+                if pct >= last_pct + 5:
+                    last_pct = pct
+                    print(f"  {channel}: {pct}% ({len(segments)} сегм.)", flush=True)
+
         return {"channel": channel, "segments": segments,
                 "info_language": info.language,
                 "info_language_probability": info.language_probability,
@@ -320,9 +331,11 @@ class Transcriber:
             for k, (channel, speaker, audio, offset) in enumerate(specs):
                 cpath = Path(tmp) / f"{channel}_{k}.wav"
                 save_wav(cpath, audio, sr)
-                args_list.append((channel, speaker, str(cpath), offset, self.model_name,
-                                  self.language, self.device, self.compute_type,
-                                  self.models_dir, cpu_threads, self.vad))
+                chunk_dur = len(audio) / sr
+                args_list.append((channel, speaker, str(cpath), offset, chunk_dur,
+                                  self.model_name, self.language, self.device,
+                                  self.compute_type, self.models_dir, cpu_threads,
+                                  self.vad))
 
             results = []
             done = 0
