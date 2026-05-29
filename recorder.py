@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import threading
 import wave
@@ -17,6 +19,7 @@ import numpy as np
 SAMPLE_RATE = 16000  # Whisper ожидает 16 kHz
 CHANNELS = 1         # моно
 DTYPE = "int16"
+PULSE_DEVICE = "pulse"  # имя PortAudio-устройства для PulseAudio/PipeWire
 
 
 def _sd():
@@ -42,9 +45,49 @@ def get_input_devices() -> list[tuple[int, str]]:
     return result
 
 
-def get_loopback_candidates() -> list[tuple[int, str]]:
-    """Кандидаты на роль loopback (системный звук) — эвристика по имени."""
-    result = []
+def _pactl(*args: str) -> str:
+    """Вызвать pactl, вернуть stdout (или '' если pactl недоступен)."""
+    try:
+        out = subprocess.run(["pactl", *args], capture_output=True,
+                             text=True, timeout=5)
+        return out.stdout if out.returncode == 0 else ""
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ""
+
+
+def get_pulse_monitor_sources() -> list[str]:
+    """Имена PulseAudio/PipeWire monitor-источников (системный звук).
+
+    Монитор текущего default sink идёт первым — это «то, что в колонках».
+    """
+    short = _pactl("list", "sources", "short")
+    if not short:
+        return []
+    monitors = []
+    for line in short.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and ".monitor" in parts[1]:
+            monitors.append(parts[1])
+    default_sink = _pactl("get-default-sink").strip()
+    preferred = f"{default_sink}.monitor"
+    monitors.sort(key=lambda m: m != preferred)  # preferred первым
+    return monitors
+
+
+def get_loopback_candidates() -> list[tuple[int | str, str]]:
+    """Кандидаты на роль loopback (системный звук).
+
+    Идентификатор — либо int (индекс sounddevice, Windows VB-Cable/Stereo Mix),
+    либо str (имя PulseAudio-источника, Linux PipeWire/PulseAudio).
+    """
+    result: list[tuple[int | str, str]] = []
+    if sys.platform.startswith("linux"):
+        # На PipeWire/PulseAudio monitor видны через pactl, а не через PortAudio
+        for name in get_pulse_monitor_sources():
+            result.append((name, name))
+        if result:
+            return result
+
     for i, dev in enumerate(query_devices()):
         if dev["max_input_channels"] < 1:
             continue
@@ -126,20 +169,27 @@ class CallRecorder:
 
         streams = []
         try:
+            # PortAudio считывает PULSE_SOURCE в момент start(), поэтому каждый
+            # поток стартуем сразу после открытия — пока окружение корректно.
+            # Микрофон: при чистой PULSE_SOURCE берётся default source.
             if self.mic_device is not None:
-                streams.append(sd.InputStream(
-                    device=self.mic_device, channels=CHANNELS, samplerate=SAMPLE_RATE,
-                    dtype=DTYPE, callback=self._mic_callback))
+                os.environ.pop("PULSE_SOURCE", None)
+                s = self._open_stream(sd, self.mic_device, self._mic_callback,
+                                      is_loopback=False)
+                s.start()
+                streams.append(s)
+
+            # Loopback: строка → имя PulseAudio-источника (monitor) через 'pulse'
+            # + PULSE_SOURCE; int → обычный индекс sounddevice (Windows VB-Cable).
             if self.loopback_device is not None:
-                streams.append(sd.InputStream(
-                    device=self.loopback_device, channels=CHANNELS, samplerate=SAMPLE_RATE,
-                    dtype=DTYPE, callback=self._sys_callback))
+                s = self._open_stream(sd, self.loopback_device, self._sys_callback,
+                                      is_loopback=True)
+                s.start()
+                streams.append(s)
 
             if not streams:
                 raise RuntimeError("Не задано ни одного устройства записи (mic/loopback)")
 
-            for s in streams:
-                s.start()
             print("✓ Запись началась")
 
             if stop_event is None:
@@ -148,11 +198,25 @@ class CallRecorder:
                 while not self._stop_event.is_set():
                     self._stop_event.wait(0.2)
         finally:
+            os.environ.pop("PULSE_SOURCE", None)
             for s in streams:
                 s.stop()
                 s.close()
 
         return self._save()
+
+    def _open_stream(self, sd, device, callback, is_loopback: bool):  # noqa: ANN001
+        """Создать InputStream.
+
+        Для loopback строковый device на Linux — это имя PulseAudio-источника
+        (monitor): открываем через 'pulse' + PULSE_SOURCE. Для микрофона device
+        (int-индекс или имя устройства вроде 'pulse'/'default') передаётся как есть.
+        """
+        if is_loopback and isinstance(device, str) and sys.platform.startswith("linux"):
+            os.environ["PULSE_SOURCE"] = device
+            device = PULSE_DEVICE
+        return sd.InputStream(device=device, channels=CHANNELS, samplerate=SAMPLE_RATE,
+                              dtype=DTYPE, callback=callback)
 
     def _save(self) -> Path:
         with self._lock:

@@ -33,6 +33,48 @@ def _ask_int(prompt: str, allow_none: bool = True) -> int | None:
             print("  Введи число (или пусто чтобы пропустить).")
 
 
+def _ask_mic() -> int | str | None:
+    """Микрофон: число — индекс sounddevice; на Linux можно имя ('pulse'/'default').
+
+    На PipeWire/PulseAudio индекс 'pulse' часто не открывает моно, поэтому по
+    умолчанию (Enter) предлагаем имя 'pulse' — оно пишет с default source.
+    """
+    linux = sys.platform.startswith("linux")
+    default = "pulse" if linux else None
+    hint = " [Enter — 'pulse']" if linux else " (Enter — пропустить)"
+    while True:
+        raw = input(f"Микрофон: ID или имя устройства{hint}: ").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return raw  # имя устройства, напр. 'pulse'/'default'
+
+
+def _ask_loopback(cands: list) -> int | str | None:
+    """Выбрать loopback: номер из списка кандидатов, либо ручной индекс, либо пропуск."""
+    if cands:
+        prompt = "Номер loopback-источника из списка (Enter — пропустить): "
+    else:
+        prompt = "ID loopback-устройства (Enter — пропустить): "
+    while True:
+        raw = input(prompt).strip()
+        if not raw:
+            return None
+        try:
+            num = int(raw)
+        except ValueError:
+            print("  Введи число (или пусто чтобы пропустить).")
+            continue
+        if cands:
+            if 0 <= num < len(cands):
+                return cands[num][0]  # идентификатор (str-имя или int-индекс)
+            print(f"  Номер должен быть 0..{len(cands) - 1}.")
+            continue
+        return num  # кандидатов нет — трактуем как индекс sounddevice
+
+
 def run_setup() -> None:
     try:
         import sounddevice  # noqa: F401
@@ -47,11 +89,11 @@ def run_setup() -> None:
     from recorder import get_loopback_candidates
     cands = get_loopback_candidates()
     if cands:
-        print("\nВозможные loopback-устройства (системный звук):")
-        for idx, name in cands:
-            print(f"  [{idx}] {name}")
+        print("\nВозможные loopback-источники (системный звук), первый — рекомендуемый:")
+        for n, (_ident, name) in enumerate(cands):
+            print(f"  ({n}) {name}")
     else:
-        print("\n⚠ Loopback-устройства не найдены автоматически.")
+        print("\n⚠ Loopback-источники не найдены автоматически.")
         if sys.platform == "win32":
             print("  Windows: установи VB-Cable или включи 'Стерео микшер'.")
         elif sys.platform.startswith("linux"):
@@ -59,8 +101,8 @@ def run_setup() -> None:
 
     cfg = load_config()
     print()
-    mic = _ask_int("ID микрофона (вход): ")
-    loop = _ask_int("ID системного звука/loopback (Enter — пропустить): ")
+    mic = _ask_mic()
+    loop = _ask_loopback(cands)
     lang = input(f"Язык [{cfg.get('language', 'ru')}]: ").strip() or cfg.get("language", "ru")
 
     cfg["mic_device"] = mic

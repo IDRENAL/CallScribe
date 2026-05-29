@@ -42,8 +42,11 @@ sudo apt install libportaudio2
 
 - **Windows:** установить [VB-Cable](https://vb-audio.com/Cable/) и выбрать «CABLE Output»,
   либо включить «Стерео микшер» в записывающих устройствах.
-- **Linux (PulseAudio/PipeWire):** использовать `*.monitor`-источник
-  (`pactl list sources short`).
+- **Linux (PulseAudio/PipeWire):** системный звук — это `*.monitor` текущего sink'а.
+  Поставь `pulseaudio-utils` (`sudo apt install pulseaudio-utils`) — тогда `setup`
+  сам найдёт monitor-источники через `pactl` и предложит нужный (монитор default
+  sink — первым). Запись с monitor идёт через устройство `pulse` + `PULSE_SOURCE`,
+  поэтому индекс PortAudio для этого не нужен.
 
 ## Настройка
 
