@@ -39,6 +39,13 @@
   button.danger{border-color:var(--err);color:var(--err)}
   .timer{font-size:22px;text-align:center;margin:6px 0;color:var(--accent);
          font-variant-numeric:tabular-nums}
+  #dropzone{border:1.5px dashed var(--border);border-radius:10px;padding:16px 10px;
+            text-align:center;color:var(--muted);cursor:pointer;transition:all .15s;
+            background:var(--panel2)}
+  #dropzone:hover{border-color:var(--accent);color:var(--fg)}
+  #dropzone.over{border-color:var(--accent);background:#13241d;color:var(--accent)}
+  #dropzone .dz-icon{font-size:22px;color:var(--accent);margin-bottom:4px}
+  #dropzone .dz-hint{font-size:10px;margin-top:4px;opacity:.7}
   .file-list{display:flex;flex-direction:column;gap:6px}
   .file{padding:9px 10px;border:1px solid var(--border);border-radius:8px;
         background:var(--panel2);cursor:pointer;transition:all .15s}
@@ -94,6 +101,15 @@
       <h3>Обработка</h3>
       <button id="btnTranscribe" onclick="transcribe()" disabled>Транскрибировать</button>
       <button id="btnProcess" onclick="processAll()" disabled>Обработать (всё)</button>
+    </section>
+    <section>
+      <h3>Внешний файл</h3>
+      <div id="dropzone" onclick="document.getElementById('fileInput').click()">
+        <div class="dz-icon">⤓</div>
+        <div>Перетащи сюда</div>
+        <div class="dz-hint">видео/аудио звонка (mp4, mkv, mp3…)</div>
+      </div>
+      <input type="file" id="fileInput" accept="audio/*,video/*,.mp4,.mkv,.mov,.webm,.m4a,.mp3,.ogg,.flac" hidden>
     </section>
     <section>
       <h3>Записи</h3>
@@ -280,8 +296,40 @@ async function openFile(type){const path=lastFile[type];if(!path)return;
   await post('/api/open',{path});}
 async function refreshFiles(){const r=await fetch('/api/files');renderFiles(await r.json());}
 
+// ---- drag-and-drop загрузка внешних файлов ----
+function setupDropzone(){
+  const dz=document.getElementById('dropzone');
+  const input=document.getElementById('fileInput');
+  input.addEventListener('change',()=>{if(input.files[0])uploadFile(input.files[0]);input.value='';});
+  ['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{
+    e.preventDefault();e.stopPropagation();dz.classList.add('over');}));
+  ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{
+    e.preventDefault();e.stopPropagation();dz.classList.remove('over');}));
+  dz.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];if(f)uploadFile(f);});
+  // файл, бросаемый в любое место окна, не должен открываться в браузере
+  ['dragover','drop'].forEach(ev=>document.addEventListener(ev,e=>e.preventDefault()));
+}
+
+function uploadFile(file){
+  if(recording||busy){appendLog('✗ Занято — дождись завершения','err');return;}
+  const fd=new FormData(); fd.append('file',file);
+  appendLog('⤓ Загрузка: '+file.name+' ('+(file.size/1048576).toFixed(1)+' MB)','info');
+  showProgress('Загрузка файла…');
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/upload');
+  xhr.upload.onprogress=e=>{if(e.lengthComputable)setProgress(Math.round(e.loaded/e.total*100),null);};
+  xhr.onload=()=>{
+    let j={}; try{j=JSON.parse(xhr.responseText);}catch(_){}
+    if(!j.ok){appendLog('✗ '+(j.reason||'ошибка загрузки'),'err');hideProgress();}
+    else appendLog('✓ Файл загружен, идёт обработка…','ok');
+  };
+  xhr.onerror=()=>{appendLog('✗ Ошибка сети при загрузке','err');hideProgress();};
+  xhr.send(fd);
+}
+
 connectWS();
 refreshFiles();
+setupDropzone();
 </script>
 </body>
 </html>

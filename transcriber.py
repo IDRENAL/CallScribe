@@ -43,14 +43,51 @@ ACCURATE_VAD_PARAMS = {"min_silence_duration_ms": 1500, "speech_pad_ms": 400}
 # --------------------------------------------------------------------------- #
 #  Выбор железа и модели
 # --------------------------------------------------------------------------- #
+def ensure_cuda_libs() -> None:
+    """Подгрузить CUDA-библиотеки (cuBLAS/cuDNN) из pip-пакетов nvidia-*.
+
+    CTranslate2 ищет libcublas.so.12 / libcudnn*.so.9 через dlopen. Предзагрузка
+    их по полному пути с RTLD_GLOBAL делает символы доступными — тогда GPU работает
+    без ручного LD_LIBRARY_PATH (так же поступает PyTorch со своими либами).
+    """
+    import ctypes
+    import glob
+    import site
+    bases = list(site.getsitepackages())
+    if hasattr(site, "getusersitepackages"):
+        bases.append(site.getusersitepackages())
+    sos: list[str] = []
+    for base in bases:
+        sos += glob.glob(os.path.join(base, "nvidia", "*", "lib", "*.so*"))
+    pending = sos
+    for _ in range(4):  # несколько проходов из-за взаимозависимостей библиотек
+        still = []
+        for so in pending:
+            try:
+                ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                still.append(so)
+        if not still or len(still) == len(pending):
+            break
+        pending = still
+
+
 def detect_compute() -> tuple[str, str]:
-    """Вернуть (device, compute_type)."""
+    """Вернуть (device, compute_type).
+
+    Наличие CUDA определяем через CTranslate2 (torch не нужен), а compute_type
+    выбираем из реально поддерживаемых карте типов. Важно для Pascal (GTX 1080):
+    float16 там не эффективен — берётся int8_float32 (точность ~float32, но быстро).
+    """
     try:
-        import torch
-        if torch.cuda.is_available():
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
-            return "cuda", ("float16" if vram_gb >= 3 else "int8")
-    except ImportError:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            ensure_cuda_libs()
+            supported = ctranslate2.get_supported_compute_types("cuda")
+            for ct in ("float16", "int8_float16", "int8_float32", "int8", "float32"):
+                if ct in supported:
+                    return "cuda", ct
+    except Exception:  # noqa: BLE001
         pass
     return "cpu", "int8"
 

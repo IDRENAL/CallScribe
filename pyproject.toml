@@ -10,4 +10,15 @@ dependencies = [
     "faster-whisper>=1.0.0",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.29",
+]
+
+[project.optional-dependencies]
+# GPU-ускорение (CUDA 12). Ставить только при наличии NVIDIA GPU:
+#   uv sync --extra gpu   (или: uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12)
+# Библиотеки подгружаются автоматически (transcriber.ensure_cuda_libs).
+gpu = [
+    "nvidia-cublas-cu12>=12.3",
+    "nvidia-cudnn-cu12>=9",
+    "nvidia-cuda-nvrtc-cu12>=12.3",
 ]

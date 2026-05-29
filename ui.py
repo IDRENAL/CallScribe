@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import get_paths, load_config
@@ -134,20 +134,36 @@ async def websocket_endpoint(ws: WebSocket):
         manager.disconnect(ws)
 
 
+MEDIA_EXTS = {".wav", ".mp4", ".mkv", ".mov", ".webm", ".m4a", ".mp3", ".ogg", ".flac"}
+
+
+def _find_source(stem: str):
+    """Найти исходный медиафайл по stem в recordings (предпочитая .wav)."""
+    cfg, paths = _config_and_paths()
+    for ext in [".wav", *sorted(MEDIA_EXTS - {".wav"})]:
+        p = paths["recordings"] / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
 def _list_files() -> list[dict]:
     cfg, paths = _config_and_paths()
     recordings = paths["recordings"]
     transcripts = paths["transcripts"]
+    media = [p for p in recordings.iterdir()
+             if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
     files = []
-    for wav in sorted(recordings.glob("call_*.wav"), reverse=True):
-        stem = wav.stem
-        stat = wav.stat()
+    for src in sorted(media, key=lambda p: p.stat().st_mtime, reverse=True):
+        stem = src.stem
+        stat = src.stat()
         try:
             dt = datetime.strptime(stem, "call_%Y-%m-%d_%H-%M-%S").strftime("%Y-%m-%d %H:%M")
         except ValueError:
             dt = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
         files.append({
             "stem": stem,
+            "name": src.name,
             "date": dt,
             "size_mb": round(stat.st_size / 1024 ** 2, 1),
             "has_transcript": (transcripts / f"{stem}_transcript.md").exists(),
@@ -230,11 +246,8 @@ def _run_job(label: str, fn):
     return JSONResponse({"ok": True})
 
 
-def _do_transcribe(stem: str):
+def _do_transcribe_path(src: Path):
     cfg, paths = _config_and_paths()
-    wav = paths["recordings"] / f"{stem}.wav"
-    if not wav.exists():
-        raise FileNotFoundError(f"Нет файла {wav.name}")
     tr = Transcriber(paths["transcripts"], paths["models"],
                      language=cfg.get("language", "ru"),
                      model_name=cfg.get("whisper_model"),
@@ -242,12 +255,19 @@ def _do_transcribe(stem: str):
                      compute_type=cfg.get("compute_type"),
                      vad=cfg.get("vad", True),
                      speaker_labels=cfg.get("speaker_labels"))
-    result = tr.transcribe(wav)
-    md = paths["transcripts"] / f"{stem}_transcript.md"
+    tr.transcribe(src)
+    md = paths["transcripts"] / f"{src.stem}_transcript.md"
     manager.broadcast_sync({
         "type": "job_done", "label": "Транскрипция готова",
         "content": md.read_text(encoding="utf-8"),
         "content_type": "transcript", "file_path": str(md)})
+
+
+def _do_transcribe(stem: str):
+    src = _find_source(stem)
+    if src is None:
+        raise FileNotFoundError(f"Нет исходного файла для {stem}")
+    _do_transcribe_path(src)
 
 
 @app.post("/api/transcribe")
@@ -265,6 +285,32 @@ async def api_process(body: dict):
     if not stem:
         return JSONResponse({"ok": False, "reason": "no_stem"})
     return _run_job("Обработка…", lambda: _do_transcribe(stem))
+
+
+def _safe_name(filename: str) -> str:
+    """Безопасное имя файла: только базовое имя, без разделителей путей."""
+    base = Path(filename or "upload").name
+    return "".join(c for c in base if c.isalnum() or c in " ._-()").strip() or "upload"
+
+
+@app.post("/api/upload")
+async def api_upload(file: UploadFile = File(...)):
+    if state.busy or state.recording:
+        return JSONResponse({"ok": False, "reason": "busy"})
+    cfg, paths = _config_and_paths()
+    name = _safe_name(file.filename)
+    if Path(name).suffix.lower() not in MEDIA_EXTS:
+        return JSONResponse({"ok": False, "reason": "unsupported_format"})
+
+    dest = paths["recordings"] / name
+    # Потоковая запись на диск (файлы могут быть большими — видео звонка)
+    with dest.open("wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            f.write(chunk)
+    print(f"✓ Загружен файл: {name} ({dest.stat().st_size / 1024 ** 2:.1f} MB)")
+
+    manager.broadcast_sync({"type": "files", "files": _list_files()})
+    return _run_job(f"Обработка {name}…", lambda: _do_transcribe_path(dest))
 
 
 @app.post("/api/open")
