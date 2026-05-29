@@ -44,7 +44,11 @@ def _transcribe_path(cfg: dict, wav_path: Path) -> None:
     from transcriber import Transcriber
     tr = Transcriber(paths["transcripts"], paths["models"],
                      language=cfg.get("language", "ru"),
-                     model_name=cfg.get("whisper_model"))
+                     model_name=cfg.get("whisper_model"),
+                     mode=cfg.get("mode", "accurate"),
+                     compute_type=cfg.get("compute_type"),
+                     vad=cfg.get("vad", True),
+                     speaker_labels=cfg.get("speaker_labels"))
     tr.transcribe(wav_path)
 
 

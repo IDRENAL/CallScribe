@@ -130,6 +130,42 @@ def save_wav(path: str | Path, audio: np.ndarray, sample_rate: int = SAMPLE_RATE
         wf.writeframes(audio.tobytes())
 
 
+def save_stereo_wav(path: str | Path, mic: np.ndarray, sys_audio: np.ndarray,
+                    sample_rate: int = SAMPLE_RATE) -> None:
+    """Сохранить два моно-потока в стерео WAV: L=микрофон, R=системный звук.
+
+    Каналы хранятся раздельно (без потерь) → режим максимальной точности
+    может расшифровать каждый отдельно, не теряя реплики при наложении речи.
+    """
+    n = min(len(mic), len(sys_audio))
+    stereo = np.stack([mic[:n], sys_audio[:n]], axis=1)  # (N, 2) int16
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(stereo.tobytes())
+
+
+def read_wav(path: str | Path) -> tuple[np.ndarray, int, int]:
+    """Прочитать WAV → (audio int16 [N] или [N,channels], sample_rate, channels)."""
+    with wave.open(str(path), "rb") as wf:
+        channels = wf.getnchannels()
+        sr = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+    audio = np.frombuffer(raw, dtype=np.int16)
+    if channels > 1:
+        audio = audio.reshape(-1, channels)
+    return audio, sr, channels
+
+
+def split_stereo(path: str | Path) -> tuple[np.ndarray, np.ndarray, int]:
+    """Разделить стерео WAV на (mic=L, sys=R, sample_rate). Моно → (audio, тишина)."""
+    audio, sr, channels = read_wav(path)
+    if channels >= 2:
+        return audio[:, 0].copy(), audio[:, 1].copy(), sr
+    return audio.copy(), np.zeros_like(audio), sr
+
+
 class CallRecorder:
     """Захват микрофона и системного звука в параллельные буферы."""
 
@@ -225,13 +261,21 @@ class CallRecorder:
             sys_audio = (np.concatenate(self.sys_frames).flatten()
                          if self.sys_frames else np.zeros(0, dtype=np.int16))
 
-        mixed = mix_audio(mic, sys_audio)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         stem = "call_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         path = self.output_dir / f"{stem}.wav"
-        save_wav(path, mixed)
-        dur = len(mixed) / SAMPLE_RATE
-        print(f"✓ Сохранено: {path.name} ({dur:.1f} сек)")
+
+        # Оба канала → стерео (L=mic, R=sys), каналы сохраняются раздельно.
+        # Только один источник → обычное моно.
+        if mic.size and sys_audio.size:
+            save_stereo_wav(path, mic, sys_audio)
+            dur = min(len(mic), len(sys_audio)) / SAMPLE_RATE
+            print(f"✓ Сохранено (стерео L=mic/R=sys): {path.name} ({dur:.1f} сек)")
+        else:
+            mono = mic if mic.size else sys_audio
+            save_wav(path, mono)
+            dur = len(mono) / SAMPLE_RATE
+            print(f"✓ Сохранено (моно): {path.name} ({dur:.1f} сек)")
         return path
 
     def stop(self) -> None:

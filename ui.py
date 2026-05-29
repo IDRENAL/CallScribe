@@ -237,7 +237,11 @@ def _do_transcribe(stem: str):
         raise FileNotFoundError(f"Нет файла {wav.name}")
     tr = Transcriber(paths["transcripts"], paths["models"],
                      language=cfg.get("language", "ru"),
-                     model_name=cfg.get("whisper_model"))
+                     model_name=cfg.get("whisper_model"),
+                     mode=cfg.get("mode", "accurate"),
+                     compute_type=cfg.get("compute_type"),
+                     vad=cfg.get("vad", True),
+                     speaker_labels=cfg.get("speaker_labels"))
     result = tr.transcribe(wav)
     md = paths["transcripts"] / f"{stem}_transcript.md"
     manager.broadcast_sync({

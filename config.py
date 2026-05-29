@@ -15,6 +15,10 @@ DEFAULT_CONFIG: dict = {
     "loopback_device": None,
     "language": "ru",
     "whisper_model": None,  # None → авто-выбор (всегда large-v3 по плану)
+    "mode": "accurate",     # "accurate" (раздельные каналы, один проход) | "fast"
+    "compute_type": None,   # None → авто; "float32"/"float16"/"int8"
+    "vad": True,            # мягкий VAD (не режет тихую речь)
+    "speaker_labels": {"mic": "Я", "loopback": "Собеседник"},
     "output": {
         "recordings": "recordings",
         "transcripts": "transcripts",
