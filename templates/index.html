@@ -39,6 +39,11 @@
   button.danger{border-color:var(--err);color:var(--err)}
   .timer{font-size:22px;text-align:center;margin:6px 0;color:var(--accent);
          font-variant-numeric:tabular-nums}
+  .device-row{display:flex;align-items:center;gap:8px;margin-bottom:10px;
+              color:var(--muted);font-size:12px}
+  .device-row select{flex:1;font-family:inherit;font-size:12px;background:var(--panel2);
+                      color:var(--fg);border:1px solid var(--border);border-radius:6px;
+                      padding:6px 8px;cursor:pointer}
   #dropzone{border:1.5px dashed var(--border);border-radius:10px;padding:16px 10px;
             text-align:center;color:var(--muted);cursor:pointer;transition:all .15s;
             background:var(--panel2)}
@@ -99,6 +104,14 @@
     </section>
     <section>
       <h3>Обработка</h3>
+      <div class="device-row">
+        <span>Считать на:</span>
+        <select id="deviceSel">
+          <option value="auto">Авто</option>
+          <option value="cpu">CPU</option>
+          <option value="cuda">GPU</option>
+        </select>
+      </div>
       <button id="btnTranscribe" onclick="transcribe()" disabled>Транскрибировать</button>
       <button id="btnProcess" onclick="processAll()" disabled>Обработать (всё)</button>
     </section>
@@ -286,15 +299,29 @@ async function post(url,body){
 async function startRec(){const j=await post('/api/record/start');
   if(!j.ok)appendLog('✗ Занято: '+(j.reason||''),'err');}
 async function stopRec(){await post('/api/record/stop');}
+function getDevice(){return document.getElementById('deviceSel').value;}
 async function transcribe(){if(!selectedStem)return;
-  const j=await post('/api/transcribe',{stem:selectedStem});
+  const j=await post('/api/transcribe',{stem:selectedStem,device:getDevice()});
   if(!j.ok)appendLog('✗ '+(j.reason||'ошибка'),'err');}
 async function processAll(){if(!selectedStem)return;
-  const j=await post('/api/process',{stem:selectedStem});
+  const j=await post('/api/process',{stem:selectedStem,device:getDevice()});
   if(!j.ok)appendLog('✗ '+(j.reason||'ошибка'),'err');}
 async function openFile(type){const path=lastFile[type];if(!path)return;
   await post('/api/open',{path});}
 async function refreshFiles(){const r=await fetch('/api/files');renderFiles(await r.json());}
+
+async function loadInfo(){
+  try{
+    const info=await (await fetch('/api/info')).json();
+    const sel=document.getElementById('deviceSel');
+    const gpuOpt=[...sel.options].find(o=>o.value==='cuda');
+    if(!info.has_gpu){gpuOpt.disabled=true;gpuOpt.textContent='GPU (нет)';}
+    else gpuOpt.textContent='GPU';
+    // дефолт из конфига, но не выбираем недоступный GPU
+    if(info.default_device==='cuda'&&!info.has_gpu)sel.value='cpu';
+    else sel.value=info.default_device||'auto';
+  }catch(_){}
+}
 
 // ---- drag-and-drop загрузка внешних файлов ----
 function setupDropzone(){
@@ -312,7 +339,7 @@ function setupDropzone(){
 
 function uploadFile(file){
   if(recording||busy){appendLog('✗ Занято — дождись завершения','err');return;}
-  const fd=new FormData(); fd.append('file',file);
+  const fd=new FormData(); fd.append('file',file); fd.append('device',getDevice());
   appendLog('⤓ Загрузка: '+file.name+' ('+(file.size/1048576).toFixed(1)+' MB)','info');
   showProgress('Загрузка файла…');
   const xhr=new XMLHttpRequest();
@@ -329,6 +356,7 @@ function uploadFile(file){
 
 connectWS();
 refreshFiles();
+loadInfo();
 setupDropzone();
 </script>
 </body>

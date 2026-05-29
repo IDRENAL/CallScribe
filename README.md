@@ -28,6 +28,13 @@ Windows 10/11 и Linux (Ubuntu 22.04+/Debian 12+).
 Дополнительно: `compute_type` (`null`=авто / `float32`=точнее на CPU / `int8`),
 `vad` (мягкий VAD вкл/выкл), `speaker_labels` (подписи дорожек).
 
+### Выбор устройства (CPU / GPU)
+
+`device` в `config.json`: `auto` (GPU если есть, иначе CPU) / `cpu` / `cuda`.
+В веб-интерфейсе есть селектор «Считать на: Авто / CPU / GPU» (GPU неактивен,
+если карта не найдена) — выбор применяется к запускаемой задаче. В CLI —
+флаг `--device`: `python main.py transcribe call.mp4 --device cpu`.
+
 ## Установка
 
 Требуется **Python 3.12+**.

@@ -16,6 +16,7 @@ DEFAULT_CONFIG: dict = {
     "language": "ru",
     "whisper_model": None,  # None → авто-выбор (всегда large-v3 по плану)
     "mode": "accurate",     # "accurate" (раздельные каналы, один проход) | "fast"
+    "device": "auto",       # "auto" (GPU если есть) | "cpu" | "cuda"
     "compute_type": None,   # None → авто; "float32"/"float16"/"int8"
     "vad": True,            # мягкий VAD (не режет тихую речь)
     "speaker_labels": {"mic": "Я", "loopback": "Собеседник"},

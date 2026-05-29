@@ -72,23 +72,35 @@ def ensure_cuda_libs() -> None:
         pending = still
 
 
-def detect_compute() -> tuple[str, str]:
-    """Вернуть (device, compute_type).
-
-    Наличие CUDA определяем через CTranslate2 (torch не нужен), а compute_type
-    выбираем из реально поддерживаемых карте типов. Важно для Pascal (GTX 1080):
-    float16 там не эффективен — берётся int8_float32 (точность ~float32, но быстро).
-    """
+def cuda_available() -> bool:
+    """Есть ли пригодное CUDA-устройство (через CTranslate2, torch не нужен)."""
     try:
         import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def detect_compute(prefer: str = "auto") -> tuple[str, str]:
+    """Вернуть (device, compute_type) с учётом предпочтения пользователя.
+
+    prefer: "auto" (GPU если есть, иначе CPU) | "cpu" | "cuda"/"gpu".
+    compute_type выбирается из реально поддерживаемых карте типов. Важно для
+    Pascal (GTX 1080): float16 неэффективен — берётся int8_float32.
+    """
+    prefer = (prefer or "auto").lower()
+    if prefer != "cpu" and cuda_available():
+        try:
+            import ctranslate2
             ensure_cuda_libs()
             supported = ctranslate2.get_supported_compute_types("cuda")
             for ct in ("float16", "int8_float16", "int8_float32", "int8", "float32"):
                 if ct in supported:
                     return "cuda", ct
-    except Exception:  # noqa: BLE001
-        pass
+        except Exception:  # noqa: BLE001
+            pass
+    if prefer in ("cuda", "gpu"):
+        print("⚠ GPU запрошен, но недоступен — обработка на CPU")
     return "cpu", "int8"
 
 
@@ -255,14 +267,15 @@ class Transcriber:
     def __init__(self, transcripts_dir: str | Path, models_dir: str | Path,
                  language: str = "ru", model_name: str | None = None,
                  mode: str = "accurate", compute_type: str | None = None,
-                 vad: bool = True, speaker_labels: dict | None = None):
+                 vad: bool = True, speaker_labels: dict | None = None,
+                 device: str = "auto"):
         self.transcripts_dir = Path(transcripts_dir)
         self.models_dir = str(models_dir)
         self.language = language
         self.mode = mode
         self.vad = vad
         self.speaker_labels = speaker_labels or {"mic": "Я", "loopback": "Собеседник"}
-        self.device, auto_compute = detect_compute()
+        self.device, auto_compute = detect_compute(device)
         self.compute_type = compute_type or auto_compute  # явный из конфига имеет приоритет
         self.model_name = model_name or choose_model(self.device)
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)

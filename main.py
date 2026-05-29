@@ -39,7 +39,7 @@ def cmd_record(args) -> Path:
     return rec.record()
 
 
-def _transcribe_path(cfg: dict, wav_path: Path) -> None:
+def _transcribe_path(cfg: dict, wav_path: Path, device: str | None = None) -> None:
     paths = get_paths(cfg)
     from transcriber import Transcriber
     tr = Transcriber(paths["transcripts"], paths["models"],
@@ -48,7 +48,8 @@ def _transcribe_path(cfg: dict, wav_path: Path) -> None:
                      mode=cfg.get("mode", "accurate"),
                      compute_type=cfg.get("compute_type"),
                      vad=cfg.get("vad", True),
-                     speaker_labels=cfg.get("speaker_labels"))
+                     speaker_labels=cfg.get("speaker_labels"),
+                     device=device or cfg.get("device", "auto"))
     tr.transcribe(wav_path)
 
 
@@ -58,13 +59,13 @@ def cmd_transcribe(args) -> None:
     if not wav.exists():
         print(f"✗ Нет файла: {wav}")
         sys.exit(1)
-    _transcribe_path(cfg, wav)
+    _transcribe_path(cfg, wav, getattr(args, "device", None))
 
 
 def cmd_run(args) -> None:
     cfg = _require_config()
     wav = cmd_record(args)
-    _transcribe_path(cfg, wav)
+    _transcribe_path(cfg, wav, getattr(args, "device", None))
 
 
 def cmd_last(args) -> None:
@@ -75,7 +76,7 @@ def cmd_last(args) -> None:
         print("✗ Нет записей в recordings/")
         sys.exit(1)
     print(f"✓ Последняя запись: {wavs[-1].name}")
-    _transcribe_path(cfg, wavs[-1])
+    _transcribe_path(cfg, wavs[-1], getattr(args, "device", None))
 
 
 def cmd_setup(args) -> None:
@@ -92,14 +93,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_ui.add_argument("--port", type=int, default=5000)
     p_ui.set_defaults(func=cmd_ui)
 
-    sub.add_parser("run", help="запись + транскрипция").set_defaults(func=cmd_run)
+    p_run = sub.add_parser("run", help="запись + транскрипция")
+    p_run.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
+    p_run.set_defaults(func=cmd_run)
     sub.add_parser("record", help="только запись").set_defaults(func=cmd_record)
 
     p_tr = sub.add_parser("transcribe", help="только транскрипция")
     p_tr.add_argument("wav")
+    p_tr.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None,
+                      help="на чём считать (по умолчанию из config.json)")
     p_tr.set_defaults(func=cmd_transcribe)
 
-    sub.add_parser("last", help="обработать последний WAV").set_defaults(func=cmd_last)
+    p_last = sub.add_parser("last", help="обработать последний WAV")
+    p_last.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
+    p_last.set_defaults(func=cmd_last)
     sub.add_parser("setup", help="мастер настройки").set_defaults(func=cmd_setup)
     return p
 
