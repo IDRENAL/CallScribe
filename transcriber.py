@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from recorder import read_wav, save_wav, split_stereo
+from recorder import read_wav, save_wav
 
 SAMPLE_RATE = 16000
 OVERLAP_SEC = 2.0
@@ -79,6 +79,55 @@ def format_timestamp(seconds: float) -> str:
 
 
 # --------------------------------------------------------------------------- #
+#  Нарезка по паузам (для параллелизма accurate без разрезания слов)
+# --------------------------------------------------------------------------- #
+def find_silence_cuts(audio: np.ndarray, sr: int, target_sec: float = 300.0,
+                      min_silence_sec: float = 0.7,
+                      frame_ms: int = 30) -> list[tuple[int, int]]:
+    """Границы чанков, проходящие ТОЛЬКО по тишине — слова не режутся.
+
+    Чанк растёт минимум до target_sec, затем закрывается на ближайшей паузе
+    длиннее min_silence_sec. Если подходящих пауз нет — остаётся один кусок
+    (корректность важнее параллелизма). Возвращает список (start, end) в сэмплах.
+    """
+    n = len(audio)
+    frame = max(1, int(sr * frame_ms / 1000))
+    nf = n // frame
+    if nf < 2:
+        return [(0, n)]
+
+    fr = audio[:nf * frame].reshape(nf, frame).astype(np.float32)
+    rms = np.sqrt((fr ** 2).mean(axis=1) + 1.0)
+    speech_level = float(np.percentile(rms, 90))
+    thresh = max(150.0, speech_level * 0.06)  # консервативный порог тишины
+    silent = rms < thresh
+
+    min_sil_frames = max(1, int(min_silence_sec * 1000 / frame_ms))
+    cut_points: list[int] = []
+    i = 0
+    while i < nf:
+        if silent[i]:
+            j = i
+            while j < nf and silent[j]:
+                j += 1
+            if j - i >= min_sil_frames:
+                cut_points.append((i + j) // 2 * frame)  # середина паузы
+            i = j
+        else:
+            i += 1
+
+    target = target_sec * sr
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    for c in cut_points:
+        if c - start >= target:
+            ranges.append((start, c))
+            start = c
+    ranges.append((start, n))
+    return ranges
+
+
+# --------------------------------------------------------------------------- #
 #  Воркер (отдельный процесс) — должен быть на уровне модуля, чтобы пиклиться
 # --------------------------------------------------------------------------- #
 def _transcribe_chunk(args: tuple) -> dict:
@@ -117,11 +166,12 @@ def _transcribe_chunk(args: tuple) -> dict:
 
 
 def _transcribe_channel(args: tuple) -> dict:
-    """Воркер режима точности: один проход по целому моно-каналу (без чанков).
+    """Воркер режима точности: один проход по куску канала (нарезка по паузам).
 
-    Запускается в отдельном процессе на канал. Сегментам проставляется speaker.
+    Запускается в отдельном процессе. offset_sec прибавляется к таймстампам,
+    сегментам проставляется speaker. Куски режутся по тишине, слова не теряются.
     """
-    (channel, speaker, wav_path, model_size, language, device,
+    (channel, speaker, wav_path, offset_sec, model_size, language, device,
      compute_type, models_dir, cpu_threads, vad) = args
 
     os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
@@ -138,7 +188,7 @@ def _transcribe_channel(args: tuple) -> dict:
             vad_filter=vad, vad_parameters=ACCURATE_VAD_PARAMS, **ACCURATE_OPTS)
 
         segments = [
-            {"start": seg.start, "end": seg.end,
+            {"start": seg.start + offset_sec, "end": seg.end + offset_sec,
              "text": seg.text.strip(), "speaker": speaker, "channel": channel}
             for seg in segments_gen
         ]
@@ -170,98 +220,114 @@ class Transcriber:
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
 
     # -- публичный API ----------------------------------------------------- #
-    def transcribe(self, wav_path: str | Path) -> dict:
-        wav_path = Path(wav_path)
+    def transcribe(self, src_path: str | Path) -> dict:
+        src_path = Path(src_path)
         print(f"✓ Режим: {self.mode} | модель: {self.model_name} | "
               f"устройство: {self.device}/{self.compute_type}")
 
-        with wave.open(str(wav_path), "rb") as wf:
-            n_frames = wf.getnframes()
-            sample_rate = wf.getframerate()
-            channels = wf.getnchannels()
-        duration_sec = n_frames / sample_rate
+        channels_list, sr = self._load_channels(src_path)
+        duration_sec = max((len(a) for _, _, a in channels_list), default=0) / sr
 
         if self.mode == "accurate":
-            segments, info = self._transcribe_accurate(wav_path, channels)
+            segments, info = self._transcribe_accurate(channels_list, sr)
         else:
-            # fast: при стерео сводим в моно, иначе чанк-математика поедет
-            mono_path = wav_path
-            tmp = None
-            if channels >= 2:
-                tmp = tempfile.TemporaryDirectory()
-                mono_path = self._downmix_to_mono(wav_path, Path(tmp.name))
-                with wave.open(str(mono_path), "rb") as wf:
-                    n_frames, sample_rate = wf.getnframes(), wf.getframerate()
-            try:
-                if self.device == "cuda":
-                    segments, info = self._transcribe_single(mono_path)
-                else:
-                    segments, info = self._transcribe_parallel(
-                        mono_path, n_frames, sample_rate)
-            finally:
-                if tmp:
-                    tmp.cleanup()
+            segments, info = self._transcribe_fast(channels_list, sr)
 
-        result = self._build_result(wav_path, segments, info, duration_sec)
-        self._write_outputs(wav_path, result)
+        result = self._build_result(src_path, segments, info, duration_sec)
+        self._write_outputs(src_path, result)
         return result
 
-    @staticmethod
-    def _downmix_to_mono(wav_path: Path, tmp: Path) -> Path:
-        from recorder import mix_audio
-        audio, sr, channels = read_wav(wav_path)
-        mono = mix_audio(audio[:, 0].copy(), audio[:, 1].copy()) if channels >= 2 else audio
-        out = tmp / "mono.wav"
-        save_wav(out, mono, sr)
-        return out
+    def _load_channels(self, src_path: Path) -> tuple[list[tuple], int]:
+        """Загрузить источник в список каналов (channel_id, speaker, int16 audio).
 
-    # -- режим максимальной точности: раздельные каналы, один проход ------- #
-    def _transcribe_accurate(self, wav_path: Path,
-                             channels: int) -> tuple[list[dict], dict]:
-        # Список (channel_id, speaker, audio) для расшифровки
-        if channels >= 2:
-            mic, sysd, sr = split_stereo(wav_path)
-            jobs = [("mic", self.speaker_labels.get("mic", "Я"), mic),
-                    ("loopback", self.speaker_labels.get("loopback", "Собеседник"), sysd)]
-        else:
-            audio, sr, _ = read_wav(wav_path)
-            jobs = [("mic", None, audio)]
+        WAV: стерео → два канала (mic=L, loopback=R), моно → один канал.
+        Прочие форматы (mp4/mkv/mp3/...) декодируются PyAV в один моно-канал
+        (микшированная дорожка — разделение спикеров недоступно).
+        """
+        if src_path.suffix.lower() == ".wav":
+            audio, sr, channels = read_wav(src_path)
+            if channels >= 2:
+                return [("mic", self.speaker_labels.get("mic", "Я"), audio[:, 0].copy()),
+                        ("loopback", self.speaker_labels.get("loopback", "Собеседник"),
+                         audio[:, 1].copy())], sr
+            return [("mic", None, audio)], sr
+
+        # Видео/прочее аудио → PyAV декодирует в float32 моно 16 kHz
+        from faster_whisper.audio import decode_audio
+        print(f"✓ Декодирую {src_path.suffix} через PyAV…")
+        samples = decode_audio(str(src_path), sampling_rate=SAMPLE_RATE)
+        audio = np.clip(np.asarray(samples) * 32767.0, -32768, 32767).astype(np.int16)
+        return [("audio", None, audio)], SAMPLE_RATE
+
+    # -- режим максимальной точности: раздельные каналы, нарезка по паузам -- #
+    def _transcribe_accurate(self, channels_list: list[tuple],
+                             sr: int) -> tuple[list[dict], dict]:
+        # Каждый канал режем по паузам (на CPU) → больше параллельных задач
+        # без разрезания слов. На GPU нарезка не нужна.
+        specs: list[tuple] = []  # (channel, speaker, audio_slice, offset_sec)
+        for channel, speaker, audio in channels_list:
+            ranges = ([(0, len(audio))] if self.device == "cuda"
+                      else find_silence_cuts(audio, sr))
+            for s, e in ranges:
+                specs.append((channel, speaker, audio[s:e], s / sr))
 
         phys = get_physical_cores()
-        cpu_threads = max(1, phys // len(jobs))
-        print(f"✓ Каналов: {len(jobs)} | ядер: {phys} | потоков/канал: {cpu_threads} | "
+        n_workers = max(1, min(len(specs), max(1, phys // 2)))
+        cpu_threads = max(1, phys // n_workers)
+        print(f"✓ Каналов: {len(channels_list)} | чанков по паузам: {len(specs)} | "
+              f"воркеров: {n_workers} | потоков/воркер: {cpu_threads} | "
               f"VAD: {'вкл' if self.vad else 'выкл'}")
 
         with tempfile.TemporaryDirectory() as tmp:
             args_list = []
-            for channel, speaker, audio in jobs:
-                cpath = Path(tmp) / f"{channel}.wav"
+            for k, (channel, speaker, audio, offset) in enumerate(specs):
+                cpath = Path(tmp) / f"{channel}_{k}.wav"
                 save_wav(cpath, audio, sr)
-                args_list.append((channel, speaker, str(cpath), self.model_name,
+                args_list.append((channel, speaker, str(cpath), offset, self.model_name,
                                   self.language, self.device, self.compute_type,
                                   self.models_dir, cpu_threads, self.vad))
 
             results = []
+            done = 0
             if self.device == "cuda":
-                # на GPU не плодим процессы — каналы последовательно
                 for a in args_list:
                     results.append(_transcribe_channel(a))
-                    self._log_channel(results[-1])
+                    done += 1
+                    self._log_chunk(results[-1], done, len(specs))
             else:
-                with ProcessPoolExecutor(max_workers=len(jobs)) as ex:
-                    futures = {ex.submit(_transcribe_channel, a): a[0] for a in args_list}
+                with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                    futures = [ex.submit(_transcribe_channel, a) for a in args_list]
                     for fut in as_completed(futures):
                         results.append(fut.result())
-                        self._log_channel(results[-1])
+                        done += 1
+                        self._log_chunk(results[-1], done, len(specs))
 
         return self._merge_channels(results)
 
     @staticmethod
-    def _log_channel(res: dict) -> None:
+    def _log_chunk(res: dict, done: int, total: int) -> None:
         if res["error"]:
-            print(f"✗ Канал {res['channel']}: {res['error']}")
+            print(f"✗ Чанк {done}/{total} ({res['channel']}): {res['error']}")
         else:
-            print(f"✓ Канал {res['channel']} готов ({len(res['segments'])} сегм.)")
+            print(f"✓ Чанк {done}/{total} ({res['channel']}) — "
+                  f"{len(res['segments'])} сегм.")
+
+    # -- быстрый режим: микс в моно + нарезка на чанки в процессах --------- #
+    def _transcribe_fast(self, channels_list: list[tuple],
+                         sr: int) -> tuple[list[dict], dict]:
+        from recorder import mix_audio
+        if len(channels_list) >= 2:
+            mono = mix_audio(channels_list[0][2], channels_list[1][2])
+        else:
+            mono = channels_list[0][2]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mono_path = Path(tmp) / "mono.wav"
+            save_wav(mono_path, mono, sr)
+            n_frames = len(mono)
+            if self.device == "cuda":
+                return self._transcribe_single(mono_path)
+            return self._transcribe_parallel(mono_path, n_frames, sr)
 
     @staticmethod
     def _merge_channels(results: list[dict]) -> tuple[list[dict], dict]:
