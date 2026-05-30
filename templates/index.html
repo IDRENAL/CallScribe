@@ -114,6 +114,7 @@
       </div>
       <button id="btnTranscribe" onclick="transcribe()" disabled>Транскрибировать</button>
       <button id="btnProcess" onclick="processAll()" disabled>Обработать (всё)</button>
+      <button id="btnStopJob" class="danger" onclick="stopJob()" disabled>■ Остановить обработку</button>
     </section>
     <section>
       <h3>Внешний файл</h3>
@@ -181,6 +182,7 @@ function handleMessage(msg){
     case 'job_progress': setProgress(msg.pct,msg.label); break;
     case 'job_done': onJobDone(msg); break;
     case 'job_error': onJobError(msg.error); break;
+    case 'job_cancelled': onJobCancelled(); break;
     case 'files': renderFiles(msg.files); break;
   }
 }
@@ -207,6 +209,7 @@ function updateButtons(){
   document.getElementById('btnRec').disabled=lock;
   document.getElementById('btnTranscribe').disabled=lock||!selectedStem;
   document.getElementById('btnProcess').disabled=lock||!selectedStem;
+  document.getElementById('btnStopJob').disabled=!busy;
 }
 
 function startTimer(){timerSec=0;timerInt=setInterval(()=>{timerSec++;
@@ -240,6 +243,7 @@ function onJobDone(msg){
   refreshFiles();
 }
 function onJobError(err){setBusy(false);appendLog('✗ '+err,'err');}
+function onJobCancelled(){setBusy(false);appendLog('■ Обработка остановлена','warn');refreshFiles();}
 
 function renderFiles(files){
   const c=document.getElementById('files');
@@ -318,6 +322,8 @@ async function processAll(){if(!selectedStem)return;
 async function summarizeOne(){if(!selectedStem)return;
   const j=await post('/api/summarize',{stem:selectedStem});
   if(!j.ok)appendLog('✗ '+(j.reason||'ошибка'),'err');}
+async function stopJob(){const j=await post('/api/job/stop');
+  if(j.ok)appendLog('› Останавливаю обработку…','warn');}
 function exportDocx(){if(!selectedStem)return;
   appendLog('› Экспорт в DOCX…','info');
   window.location='/api/export?stem='+encodeURIComponent(selectedStem);}
@@ -361,9 +367,12 @@ function uploadFile(file){
   xhr.open('POST','/api/upload');
   xhr.upload.onprogress=e=>{if(e.lengthComputable)setProgress(Math.round(e.loaded/e.total*100),null);};
   xhr.onload=()=>{
+    hideProgress();
     let j={}; try{j=JSON.parse(xhr.responseText);}catch(_){}
-    if(!j.ok){appendLog('✗ '+(j.reason||'ошибка загрузки'),'err');hideProgress();}
-    else appendLog('✓ Файл загружен, идёт обработка…','ok');
+    if(!j.ok){appendLog('✗ '+(j.reason||'ошибка загрузки'),'err');return;}
+    appendLog('✓ Файл загружен — выбран, нажми «Транскрибировать» или «Обработать (всё)»','ok');
+    refreshFiles();
+    if(j.stem)selectFile(j.stem);   // выбрать, но НЕ запускать обработку
   };
   xhr.onerror=()=>{appendLog('✗ Ошибка сети при загрузке','err');hideProgress();};
   xhr.send(fd);

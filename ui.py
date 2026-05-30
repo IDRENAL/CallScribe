@@ -24,7 +24,7 @@ from config import get_paths, load_config
 from exporter import build_export
 from recorder import CallRecorder
 from summarizer import Summarizer, SummarizerError
-from transcriber import Transcriber, cuda_available
+from transcriber import Transcriber, TranscriptionCancelled, cuda_available
 
 BASE = Path(__file__).parent
 TEMPLATES = BASE / "templates"
@@ -104,6 +104,7 @@ class AppState:
     recorder: CallRecorder | None = None
     _rec_stop_event: threading.Event | None = None
     _job_thread: threading.Thread | None = None
+    _cancel_event: threading.Event | None = None
 
 
 state = AppState()
@@ -218,6 +219,15 @@ async def api_record_start():
     return JSONResponse({"ok": True})
 
 
+@app.post("/api/job/stop")
+async def api_job_stop():
+    """Прервать текущую обработку (транскрипцию) с потерей результата."""
+    if not state.busy or state._cancel_event is None:
+        return JSONResponse({"ok": False, "reason": "no_job"})
+    state._cancel_event.set()
+    return JSONResponse({"ok": True})
+
+
 @app.post("/api/record/stop")
 async def api_record_stop():
     if not state.recording or not state.recorder:
@@ -231,16 +241,22 @@ def _run_job(label: str, fn):
     if state.busy or state.recording:
         return JSONResponse({"ok": False, "reason": "busy"})
     state.busy = True
+    state._cancel_event = threading.Event()
 
     def _worker():
         try:
             manager.broadcast_sync({"type": "job_started", "label": label})
             fn()
             manager.broadcast_sync({"type": "files", "files": _list_files()})
+        except TranscriptionCancelled:
+            print("■ Обработка остановлена пользователем")
+            manager.broadcast_sync({"type": "job_cancelled"})
+            manager.broadcast_sync({"type": "files", "files": _list_files()})
         except Exception as e:  # noqa: BLE001
             manager.broadcast_sync({"type": "job_error", "error": str(e)})
         finally:
             state.busy = False
+            state._cancel_event = None
 
     t = threading.Thread(target=_worker, daemon=True)
     state._job_thread = t
@@ -260,7 +276,8 @@ def _do_transcribe_path(src: Path, device: str | None = None):
                      device=device or cfg.get("device", "auto"),
                      cpu_workers=cfg.get("cpu_workers"))
     tr.transcribe(src, progress=lambda pct: manager.broadcast_sync(
-        {"type": "job_progress", "pct": pct}))
+        {"type": "job_progress", "pct": pct}),
+        cancel=lambda: state._cancel_event is not None and state._cancel_event.is_set())
     md = paths["transcripts"] / f"{src.stem}_transcript.md"
     manager.broadcast_sync({
         "type": "job_done", "label": "Транскрипция готова",
@@ -357,7 +374,7 @@ def _safe_name(filename: str) -> str:
 
 
 @app.post("/api/upload")
-async def api_upload(file: UploadFile = File(...), device: str = Form("auto")):
+async def api_upload(file: UploadFile = File(...), device: str = Form("auto")):  # noqa: ARG001
     if state.busy or state.recording:
         return JSONResponse({"ok": False, "reason": "busy"})
     cfg, paths = _config_and_paths()
@@ -370,10 +387,12 @@ async def api_upload(file: UploadFile = File(...), device: str = Form("auto")):
     with dest.open("wb") as f:
         while chunk := await file.read(1024 * 1024):
             f.write(chunk)
-    print(f"✓ Загружен файл: {name} ({dest.stat().st_size / 1024 ** 2:.1f} MB)")
+    print(f"✓ Загружен файл: {name} ({dest.stat().st_size / 1024 ** 2:.1f} MB) "
+          f"— выбери его и запусти обработку")
 
+    # Транскрипция НЕ стартует автоматически — ждём запуска пользователем.
     manager.broadcast_sync({"type": "files", "files": _list_files()})
-    return _run_job(f"Обработка {name}…", lambda: _do_transcribe_path(dest, device))
+    return JSONResponse({"ok": True, "stem": Path(name).stem})
 
 
 @app.get("/api/export")

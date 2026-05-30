@@ -8,6 +8,7 @@ from recorder import save_stereo_wav, save_wav
 from transcriber import (
     PER_WORKER_GB,
     Transcriber,
+    TranscriptionCancelled,
     choose_model,
     detect_compute,
     find_silence_cuts,
@@ -219,3 +220,73 @@ def test_load_channels_mono_single_channel(tmp_path):
     channels, sr = tr._load_channels(p)
     assert len(channels) == 1
     assert channels[0][1] is None   # нет разделения спикеров для моно
+
+
+# --------------------------------------------------------------------------- #
+#  Отмена транскрипции
+# --------------------------------------------------------------------------- #
+def test_check_cancel_raises_when_requested(tmp_path):
+    tr = _cpu_transcriber(tmp_path)
+    tr._cancel = lambda: True
+    with pytest.raises(TranscriptionCancelled):
+        tr._check_cancel()
+
+
+def test_check_cancel_silent_when_not_requested(tmp_path):
+    tr = _cpu_transcriber(tmp_path)
+    tr._cancel = lambda: False
+    tr._check_cancel()   # не должно бросать
+
+
+def test_transcribe_channel_propagates_cancel_from_cb(monkeypatch):
+    """Внутри прохода cb бросает отмену → воркер её ПРОБРАСЫВАЕТ (не глотает)."""
+    import sys
+    import types
+
+    from transcriber import _transcribe_channel
+
+    fake = types.ModuleType("faster_whisper")
+
+    class _Seg:
+        def __init__(self, i):
+            self.start, self.end, self.text = float(i), float(i + 1), f"t{i}"
+
+    class _Info:
+        language, language_probability = "ru", 0.9
+
+    class _Model:
+        def __init__(self, *a, **k):
+            pass
+
+        def transcribe(self, *a, **k):
+            return iter([_Seg(i) for i in range(10)]), _Info()
+
+    fake.WhisperModel = _Model
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+
+    args = ("mic", "Я", "x.wav", 0.0, 60.0, "large-v3", "ru", "cpu",
+            "int8", "models", 1, False)
+    n = {"v": 0}
+
+    def cb(frac):
+        n["v"] += 1
+        if n["v"] >= 3:           # отмена на третьем сегменте
+            raise TranscriptionCancelled()
+
+    with pytest.raises(TranscriptionCancelled):
+        _transcribe_channel(args, progress_cb=cb)
+
+
+def test_transcribe_stores_cancel_callable(tmp_path, monkeypatch):
+    tr = _cpu_transcriber(tmp_path)
+    flag = {"v": True}
+    # подменяем тяжёлый разбор источника, чтобы дойти до проверки отмены без модели
+    monkeypatch.setattr(tr, "_load_channels", lambda p: ([("audio", None, [])], SR))
+
+    def fake_accurate(channels, sr):
+        tr._check_cancel()   # имитируем точку проверки внутри пайплайна
+        return [], {}
+    monkeypatch.setattr(tr, "_transcribe_accurate", fake_accurate)
+
+    with pytest.raises(TranscriptionCancelled):
+        tr.transcribe(tmp_path / "x.wav", cancel=lambda: flag["v"])

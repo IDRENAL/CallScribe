@@ -14,7 +14,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import wave
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from datetime import datetime
 from pathlib import Path
 
@@ -39,6 +39,10 @@ ACCURATE_OPTS = dict(
     word_timestamps=False,
 )
 ACCURATE_VAD_PARAMS = {"min_silence_duration_ms": 1500, "speech_pad_ms": 400}
+
+
+class TranscriptionCancelled(Exception):
+    """Транскрипция прервана пользователем (результат отбрасывается)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -278,20 +282,23 @@ def _transcribe_channel(args: tuple, progress_cb=None) -> dict:  # noqa: ANN001
             segments.append(
                 {"start": seg.start + offset_sec, "end": seg.end + offset_sec,
                  "text": seg.text.strip(), "speaker": speaker, "channel": channel})
-            if chunk_dur > 30:
-                frac = min(0.99, seg.end / chunk_dur)
+            frac = min(0.99, seg.end / chunk_dur) if chunk_dur > 30 else 0.0
+            if progress_cb is not None:
+                # cb (в основном процессе) обновляет прогресс И может бросить
+                # TranscriptionCancelled — так прерываем длинный GPU-проход.
+                progress_cb(frac)
+            elif chunk_dur > 30:
                 pct = int(frac * 100)
                 if pct >= last_pct + 2:
                     last_pct = pct
-                    if progress_cb:
-                        progress_cb(frac)
-                    else:
-                        print(f"  {channel}: {pct}% ({len(segments)} сегм.)", flush=True)
+                    print(f"  {channel}: {pct}% ({len(segments)} сегм.)", flush=True)
 
         return {"channel": channel, "segments": segments,
                 "info_language": info.language,
                 "info_language_probability": info.language_probability,
                 "error": None}
+    except TranscriptionCancelled:
+        raise  # отмена должна всплыть, а не превратиться в обычную ошибку
     except Exception as e:  # noqa: BLE001
         return {"channel": channel, "segments": [], "error": str(e)}
 
@@ -316,12 +323,15 @@ class Transcriber:
         self.compute_type = compute_type or auto_compute  # явный из конфига имеет приоритет
         self.model_name = model_name or choose_model(self.device)
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+        self._cancel = lambda: False  # переопределяется в transcribe()
 
     # -- публичный API ----------------------------------------------------- #
-    def transcribe(self, src_path: str | Path, progress=None) -> dict:  # noqa: ANN001
-        """progress(pct:int) — опциональный колбэк прогресса (0..100)."""
+    def transcribe(self, src_path: str | Path, progress=None,
+                   cancel=None) -> dict:  # noqa: ANN001
+        """progress(pct:int) — колбэк прогресса; cancel() -> bool — запрос отмены."""
         src_path = Path(src_path)
         self._progress = progress or (lambda pct: None)
+        self._cancel = cancel or (lambda: False)
         self._last_pct = -1
         print(f"✓ Режим: {self.mode} | модель: {self.model_name} | "
               f"устройство: {self.device}/{self.compute_type}")
@@ -343,6 +353,10 @@ class Transcriber:
         if pct != self._last_pct:
             self._last_pct = pct
             self._progress(pct)
+
+    def _check_cancel(self) -> None:
+        if self._cancel():
+            raise TranscriptionCancelled()
 
     def _load_channels(self, src_path: Path) -> tuple[list[tuple], int]:
         """Загрузить источник в список каналов (channel_id, speaker, int16 audio).
@@ -401,10 +415,17 @@ class Transcriber:
             done = 0
             total = len(specs)
             if self.device == "cuda":
-                # В основном процессе: прогресс внутри прохода (intra-chunk)
+                # В основном процессе: прогресс внутри прохода (intra-chunk).
+                # cb проверяет отмену на каждом сегменте → можно прервать даже
+                # один длинный GPU-проход на весь звонок.
+                def make_cb(i):
+                    def cb(frac):
+                        self._check_cancel()
+                        self._emit_progress((i + frac) / total)
+                    return cb
                 for i, a in enumerate(args_list):
-                    cb = lambda frac, i=i: self._emit_progress((i + frac) / total)
-                    results.append(_transcribe_channel(a, progress_cb=cb))
+                    self._check_cancel()
+                    results.append(_transcribe_channel(a, progress_cb=make_cb(i)))
                     done += 1
                     self._emit_progress(done / total)
                     self._log_chunk(results[-1], done, total)
@@ -415,12 +436,21 @@ class Transcriber:
                 # и fork от него ломает пул (BrokenProcessPool).
                 ctx = mp.get_context("spawn")
                 with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
-                    futures = [ex.submit(_transcribe_channel, a) for a in args_list]
-                    for fut in as_completed(futures):
-                        results.append(fut.result())
-                        done += 1
-                        self._emit_progress(done / total)
-                        self._log_chunk(results[-1], done, total)
+                    pending = {ex.submit(_transcribe_channel, a) for a in args_list}
+                    while pending:
+                        if self._cancel():
+                            # жёстко гасим воркеры — освобождаем CPU/ОЗУ сразу
+                            for p in ex._processes.values():
+                                p.terminate()
+                            ex.shutdown(wait=False, cancel_futures=True)
+                            raise TranscriptionCancelled()
+                        finished, pending = wait(pending, timeout=0.5,
+                                                 return_when=FIRST_COMPLETED)
+                        for fut in finished:
+                            results.append(fut.result())
+                            done += 1
+                            self._emit_progress(done / total)
+                            self._log_chunk(results[-1], done, total)
 
         return self._merge_channels(results)
 
@@ -471,6 +501,7 @@ class Transcriber:
             vad_parameters={"min_silence_duration_ms": 500}, word_timestamps=False)
         segments = []
         for seg in segments_gen:
+            self._check_cancel()
             segments.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
             print(f"[{format_timestamp(seg.start)}] {seg.text.strip()}")
         return segments, {"language": info.language,
@@ -494,16 +525,25 @@ class Transcriber:
             results_map: dict[int, dict] = {}
             ctx = mp.get_context("spawn")  # см. accurate: fork после CUDA ломает пул
             with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
-                futures = {executor.submit(_transcribe_chunk, a): a[0] for a in task_args}
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    res = future.result()
-                    results_map[idx] = res
-                    if res["error"]:
-                        print(f"✗ Чанк {idx + 1}/{n_chunks}: {res['error']}")
-                    else:
-                        print(f"✓ Чанк {idx + 1}/{n_chunks} готов "
-                              f"({len(res['segments'])} сегм.)")
+                fut_idx = {executor.submit(_transcribe_chunk, a): a[0] for a in task_args}
+                pending = set(fut_idx)
+                while pending:
+                    if self._cancel():
+                        for p in executor._processes.values():
+                            p.terminate()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise TranscriptionCancelled()
+                    finished, pending = wait(pending, timeout=0.5,
+                                             return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        idx = fut_idx[future]
+                        res = future.result()
+                        results_map[idx] = res
+                        if res["error"]:
+                            print(f"✗ Чанк {idx + 1}/{n_chunks}: {res['error']}")
+                        else:
+                            print(f"✓ Чанк {idx + 1}/{n_chunks} готов "
+                                  f"({len(res['segments'])} сегм.)")
 
         return self._merge_results(results_map)
 
