@@ -31,3 +31,9 @@ gpu = [
     "nvidia-cudnn-cu12>=9",
     "nvidia-cuda-nvrtc-cu12>=12.3",
 ]
+# Диаризация спикеров для одиночных дорожек (mp4/моно). Тянет torch:
+#   uv sync --extra diarize
+# Плюс нужен HF-токен и принятые условия модели pyannote на huggingface.co.
+diarize = [
+    "pyannote.audio>=3.1",
+]

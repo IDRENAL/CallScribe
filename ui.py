@@ -274,7 +274,8 @@ def _do_transcribe_path(src: Path, device: str | None = None):
                      vad=cfg.get("vad", True),
                      speaker_labels=cfg.get("speaker_labels"),
                      device=device or cfg.get("device", "auto"),
-                     cpu_workers=cfg.get("cpu_workers"))
+                     cpu_workers=cfg.get("cpu_workers"),
+                     diarize=cfg.get("diarize"))
     tr.transcribe(src, progress=lambda pct: manager.broadcast_sync(
         {"type": "job_progress", "pct": pct}),
         cancel=lambda: state._cancel_event is not None and state._cancel_event.is_set())

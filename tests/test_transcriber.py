@@ -290,3 +290,53 @@ def test_transcribe_stores_cancel_callable(tmp_path, monkeypatch):
 
     with pytest.raises(TranscriptionCancelled):
         tr.transcribe(tmp_path / "x.wav", cancel=lambda: flag["v"])
+
+
+# --------------------------------------------------------------------------- #
+#  Диаризация (интеграция в transcriber)
+# --------------------------------------------------------------------------- #
+def _seg(s, e, t="x"):
+    return {"start": float(s), "end": float(e), "text": t}
+
+
+def test_maybe_diarize_noop_when_disabled(tmp_path):
+    tr = _cpu_transcriber(tmp_path)
+    tr.diarize = {"enabled": False}
+    segs = [_seg(0, 1)]
+    chans = [("audio", None, np.zeros(10, dtype=np.int16))]
+    assert tr._maybe_diarize(chans, SR, segs) is segs
+
+
+def test_maybe_diarize_noop_for_stereo(tmp_path):
+    tr = _cpu_transcriber(tmp_path)
+    tr.diarize = {"enabled": True}   # включено, но каналы уже разделены
+    segs = [_seg(0, 1)]
+    chans = [("mic", "Я", np.zeros(10, dtype=np.int16)),
+             ("loopback", "Собеседник", np.zeros(10, dtype=np.int16))]
+    assert tr._maybe_diarize(chans, SR, segs) is segs
+
+
+def test_maybe_diarize_graceful_on_error(tmp_path, monkeypatch):
+    tr = _cpu_transcriber(tmp_path)
+    tr.diarize = {"enabled": True}
+    import diarizer
+    monkeypatch.setattr(diarizer.Diarizer, "diarize",
+                        lambda self, p: (_ for _ in ()).throw(RuntimeError("no model")))
+    segs = [_seg(0, 1)]
+    chans = [("audio", None, np.zeros(SR, dtype=np.int16))]
+    out = tr._maybe_diarize(chans, SR, segs)
+    assert out == segs   # транскрипция не падает, просто без меток спикеров
+
+
+def test_maybe_diarize_assigns_speakers_for_single_track(tmp_path, monkeypatch):
+    tr = _cpu_transcriber(tmp_path)
+    tr.diarize = {"enabled": True}
+    import diarizer
+    monkeypatch.setattr(diarizer.Diarizer, "diarize",
+                        lambda self, p: [(0.0, 2.0, "SPEAKER_00"),
+                                         (2.0, 4.0, "SPEAKER_01")])
+    segs = [_seg(0.0, 1.5, "a"), _seg(2.5, 3.5, "b")]
+    chans = [("audio", None, np.zeros(SR * 4, dtype=np.int16))]
+    out = tr._maybe_diarize(chans, SR, segs)
+    assert out[0]["speaker"] == "Спикер 1"
+    assert out[1]["speaker"] == "Спикер 2"

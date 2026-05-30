@@ -21,6 +21,13 @@ DEFAULT_CONFIG: dict = {
     "vad": True,            # мягкий VAD (не режет тихую речь)
     "cpu_workers": None,    # None → авто (по ядрам И свободной ОЗУ); число → жёсткий лимит
     "speaker_labels": {"mic": "Я", "loopback": "Собеседник"},
+    "diarize": {                       # v2.0: разделение спикеров для mp4/моно
+        "enabled": False,              # по умолчанию выкл (нужен extra diarize + HF-токен)
+        "model": "pyannote/speaker-diarization-3.1",
+        "hf_token": None,
+        "min_speakers": None,
+        "max_speakers": None,
+    },
     "summary": {                       # v2.0: выжимка через LLM (local-first)
         "enabled": True,
         "provider": "ollama",          # "ollama" (локально) | "openai" | "none"
@@ -49,6 +56,7 @@ def load_config() -> dict:
     # вложенные блоки сливаем поключно, чтобы частичный конфиг не затирал дефолты
     merged["output"] = {**DEFAULT_CONFIG["output"], **cfg.get("output", {})}
     merged["summary"] = {**DEFAULT_CONFIG["summary"], **cfg.get("summary", {})}
+    merged["diarize"] = {**DEFAULT_CONFIG["diarize"], **cfg.get("diarize", {})}
     return merged
 
 

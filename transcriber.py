@@ -311,13 +311,15 @@ class Transcriber:
                  language: str = "ru", model_name: str | None = None,
                  mode: str = "accurate", compute_type: str | None = None,
                  vad: bool = True, speaker_labels: dict | None = None,
-                 device: str = "auto", cpu_workers: int | None = None):
+                 device: str = "auto", cpu_workers: int | None = None,
+                 diarize: dict | None = None):
         self.transcripts_dir = Path(transcripts_dir)
         self.models_dir = str(models_dir)
         self.language = language
         self.mode = mode
         self.vad = vad
         self.cpu_workers = cpu_workers  # None → авто (по ядрам и ОЗУ)
+        self.diarize = diarize or {}    # разделение спикеров для одиночных дорожек
         self.speaker_labels = speaker_labels or {"mic": "Я", "loopback": "Собеседник"}
         self.device, auto_compute = detect_compute(device)
         self.compute_type = compute_type or auto_compute  # явный из конфига имеет приоритет
@@ -344,6 +346,7 @@ class Transcriber:
         else:
             segments, info = self._transcribe_fast(channels_list, sr)
 
+        segments = self._maybe_diarize(channels_list, sr, segments)
         result = self._build_result(src_path, segments, info, duration_sec)
         self._write_outputs(src_path, result)
         return result
@@ -379,6 +382,49 @@ class Transcriber:
         samples = decode_audio(str(src_path), sampling_rate=SAMPLE_RATE)
         audio = np.clip(np.asarray(samples) * 32767.0, -32768, 32767).astype(np.int16)
         return [("audio", None, audio)], SAMPLE_RATE
+
+    def _maybe_diarize(self, channels_list: list[tuple], sr: int,
+                       segments: list[dict]) -> list[dict]:
+        """Проставить спикеров для ОДНОЙ сведённой дорожки (mp4/моно).
+
+        Для стерео-записей (каналы уже разделены) и при выключенной диаризации —
+        возвращает сегменты без изменений. Ошибки (нет extra/токена) не валят
+        транскрипцию: стенограмма сохраняется без меток спикеров.
+        """
+        if not self.diarize.get("enabled") or not segments:
+            return segments
+        # только одиночная дорожка без разделения каналов (speaker is None)
+        if not (len(channels_list) == 1 and channels_list[0][1] is None):
+            return segments
+        self._check_cancel()
+        try:
+            from diarizer import Diarizer, assign_speakers
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠ Диаризация недоступна: {e}")
+            return segments
+
+        audio = channels_list[0][2]
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = Path(tmp) / "diar.wav"
+            save_wav(wav_path, audio, sr)
+            try:
+                dz = Diarizer(model=self.diarize.get("model"),
+                              hf_token=self.diarize.get("hf_token"),
+                              device=self.device,
+                              min_speakers=self.diarize.get("min_speakers"),
+                              max_speakers=self.diarize.get("max_speakers"))
+                print("✓ Диаризация (pyannote)…")
+                turns = dz.diarize(wav_path)
+            except Exception as e:  # noqa: BLE001
+                print(f"⚠ Диаризация не выполнена: {e}")
+                return segments
+
+        if not turns:
+            print("⚠ Диаризация: спикеры не выделены")
+            return segments
+        n_spk = len({t[2] for t in turns})
+        print(f"✓ Спикеров определено: {n_spk}")
+        return assign_speakers(segments, turns)
 
     # -- режим максимальной точности: раздельные каналы, нарезка по паузам -- #
     def _transcribe_accurate(self, channels_list: list[tuple],
