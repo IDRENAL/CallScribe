@@ -3,10 +3,11 @@
 
 PY   ?= uv run python
 PORT ?= 5000
+HOST ?= 127.0.0.1
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install install-gpu setup ui run record last transcribe clean
+.PHONY: help install install-gpu setup ui ui-lan run record last transcribe clean
 
 help:  ## Показать список команд
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -21,8 +22,14 @@ install-gpu:  ## Установить зависимости + CUDA-библио
 setup:  ## Мастер настройки аудио-устройств → config.json
 	$(PY) main.py setup
 
-ui:  ## Запустить веб-интерфейс (PORT=5000 по умолчанию)
-	$(PY) main.py ui --port $(PORT)
+ui:  ## Запустить веб-интерфейс (HOST/PORT, по умолчанию 127.0.0.1:5000)
+	$(PY) main.py ui --host $(HOST) --port $(PORT)
+
+ui-lan:  ## UI, доступный по сети (для записи с ноутбука → GPU-десктоп)
+	@ip=$$(hostname -I 2>/dev/null | awk '{print $$1}'); \
+	echo "✓ Открой с ноутбука: http://$$ip:$(PORT)"; \
+	echo "⚠ Без пароля — только доверенная домашняя сеть"; \
+	$(PY) main.py ui --host 0.0.0.0 --port $(PORT)
 
 run:  ## Запись + транскрипция (CLI)
 	$(PY) main.py run
