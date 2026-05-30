@@ -9,3 +9,4 @@ __pycache__/
 .venv/
 .idea/
 callscribe_plan.md
+*.zip

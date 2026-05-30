@@ -159,6 +159,23 @@ WAV-round-trip (моно/стерео), нарезка по паузам (инв
 лимит CPU-воркеров по ОЗУ, склейка и дедупликация сегментов, разбор стерео-каналов,
 рендер Markdown, загрузка/слияние `config.json`. Тесты быстрые (~1 c), без сети.
 
+## Упаковка для передачи
+
+```bash
+make dist           # callscribe.zip — только исходники (через git archive)
+```
+
+В архив попадают исходники, тесты, `templates/`, README и пустые `recordings/`/
+`transcripts/`. **Не** попадают `config.json` (на каждой машине свои устройства),
+`models/` (~3 GB, скачается сама) и записи — они в `.gitignore`. У получателя:
+
+```bash
+unzip callscribe.zip && cd callscribe
+uv sync                # или: pip install -r requirements.txt
+uv run python main.py setup   # настроить аудио-устройства
+uv run python main.py ui
+```
+
 ## Структура
 
 ```

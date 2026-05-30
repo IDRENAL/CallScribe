@@ -7,7 +7,7 @@ HOST ?= 127.0.0.1
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install install-gpu setup ui ui-lan run record last transcribe test clean
+.PHONY: help install install-gpu setup ui ui-lan run record last transcribe test dist clean
 
 help:  ## Показать список команд
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -46,6 +46,10 @@ transcribe:  ## Транскрибировать файл: make transcribe FILE=
 
 test:  ## Прогнать тесты (pytest)
 	uv run pytest
+
+dist:  ## Собрать zip для передачи (исходники без моделей/записей/config.json)
+	@git archive --format=zip --prefix=callscribe/ -o callscribe.zip HEAD
+	@echo "✓ callscribe.zip готов ($$(du -h callscribe.zip | cut -f1)) — без models/, recordings/, config.json"
 
 clean:  ## Удалить кэш Python
 	find . -type d -name __pycache__ -prune -exec rm -rf {} + ; \
