@@ -13,6 +13,14 @@ dependencies = [
     "python-multipart>=0.0.29",
 ]
 
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
 [project.optional-dependencies]
 # GPU-ускорение (CUDA 12). Ставить только при наличии NVIDIA GPU:
 #   uv sync --extra gpu   (или: uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12)

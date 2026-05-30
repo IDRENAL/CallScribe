@@ -1,0 +1,221 @@
+"""Тесты transcriber.py — чистые функции (без загрузки модели Whisper)."""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from recorder import save_stereo_wav, save_wav
+from transcriber import (
+    PER_WORKER_GB,
+    Transcriber,
+    choose_model,
+    detect_compute,
+    find_silence_cuts,
+    format_timestamp,
+    get_physical_cores,
+    plan_cpu_workers,
+)
+
+SR = 16000
+
+
+def _speech(seconds: float, amp: int = 6000, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.integers(-amp, amp, size=int(seconds * SR), dtype=np.int16)
+
+
+def _silence(seconds: float) -> np.ndarray:
+    return np.zeros(int(seconds * SR), dtype=np.int16)
+
+
+# --------------------------------------------------------------------------- #
+#  format_timestamp
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("sec,expected", [
+    (0, "00:00"),
+    (5, "00:05"),
+    (65, "01:05"),
+    (3600, "01:00:00"),
+    (3661, "01:01:01"),
+])
+def test_format_timestamp(sec, expected):
+    assert format_timestamp(sec) == expected
+
+
+# --------------------------------------------------------------------------- #
+#  find_silence_cuts — главный инвариант: режем ТОЛЬКО по тишине
+# --------------------------------------------------------------------------- #
+def test_silence_cuts_cover_full_signal_contiguously():
+    audio = np.concatenate([_speech(4, seed=1), _silence(1.0), _speech(4, seed=2)])
+    ranges = find_silence_cuts(audio, SR, target_sec=3.0)
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == len(audio)
+    # стыки непрерывны, без пропусков и нахлёстов
+    for (a_s, a_e), (b_s, b_e) in zip(ranges, ranges[1:]):
+        assert a_e == b_s
+
+
+def test_silence_cuts_split_happens_inside_silence():
+    audio = np.concatenate([_speech(4, seed=1), _silence(1.0), _speech(4, seed=2)])
+    ranges = find_silence_cuts(audio, SR, target_sec=3.0)
+    assert len(ranges) >= 2, "должна быть хотя бы одна точка реза по паузе"
+    # каждая внутренняя граница должна попадать в тихий участок (слово не режется)
+    speech_level = float(np.percentile(np.abs(audio), 90))
+    for _, end in ranges[:-1]:
+        window = audio[max(0, end - 200):end + 200]
+        assert np.abs(window).max() < speech_level * 0.5
+
+
+def test_silence_cuts_single_chunk_without_pauses():
+    audio = _speech(10, seed=3)  # сплошная речь, пауз нет
+    ranges = find_silence_cuts(audio, SR, target_sec=3.0)
+    assert ranges == [(0, len(audio))]
+
+
+def test_silence_cuts_tiny_input():
+    assert find_silence_cuts(_speech(0.001), SR) == [(0, len(_speech(0.001)))]
+
+
+# --------------------------------------------------------------------------- #
+#  plan_cpu_workers — защита от OOM
+# --------------------------------------------------------------------------- #
+def test_plan_cpu_workers_invariants():
+    n, threads = plan_cpu_workers(12)
+    phys = get_physical_cores()
+    assert 1 <= n <= max(1, phys // 2)
+    assert n <= 12
+    assert threads >= 1
+
+
+def test_plan_cpu_workers_respects_task_count():
+    n, _ = plan_cpu_workers(1)
+    assert n == 1
+
+
+def test_plan_cpu_workers_override_caps_workers():
+    n, threads = plan_cpu_workers(12, override=2)
+    assert n == 2
+    assert threads == max(1, get_physical_cores() // 2)
+
+
+def test_plan_cpu_workers_override_zero_falls_back_to_auto():
+    # override=0 (falsy) не должен обнулять число воркеров
+    n, _ = plan_cpu_workers(8, override=0)
+    assert n >= 1
+
+
+def test_per_worker_estimate_is_reasonable():
+    assert 2.0 <= PER_WORKER_GB <= 6.0  # оценка ОЗУ на large-v3 int8
+
+
+# --------------------------------------------------------------------------- #
+#  detect_compute / choose_model
+# --------------------------------------------------------------------------- #
+def test_detect_compute_cpu_is_deterministic():
+    assert detect_compute("cpu") == ("cpu", "int8")
+
+
+def test_choose_model_always_large():
+    assert choose_model("cpu") == "large-v3"
+    assert choose_model("cuda") == "large-v3"
+
+
+# --------------------------------------------------------------------------- #
+#  Склейка каналов и дедупликация
+# --------------------------------------------------------------------------- #
+def test_merge_channels_sorts_by_time_and_keeps_language():
+    results = [
+        {"channel": "mic", "error": None, "info_language": "ru",
+         "info_language_probability": 0.97,
+         "segments": [{"start": 5.0, "text": "второй"}]},
+        {"channel": "loopback", "error": None, "info_language": "ru",
+         "info_language_probability": 0.9,
+         "segments": [{"start": 1.0, "text": "первый"}]},
+    ]
+    segs, info = Transcriber._merge_channels(results)
+    assert [s["text"] for s in segs] == ["первый", "второй"]  # по времени
+    assert info["language"] == "ru"
+
+
+def test_merge_results_dedupes_overlap_duplicates():
+    results_map = {
+        0: {"error": None, "info_language": "ru", "info_language_probability": 0.95,
+            "segments": [{"start": 0.0, "text": "привет"},
+                         {"start": 1.0, "text": "как дела"}]},
+        1: {"error": None, "info_language": "ru", "info_language_probability": 0.95,
+            "segments": [{"start": 1.2, "text": "как дела"},   # дубль из перекрытия
+                         {"start": 3.0, "text": "пока"}]},
+    }
+    segs, _ = Transcriber._merge_results(results_map)
+    texts = [s["text"] for s in segs]
+    assert texts == ["привет", "как дела", "пока"]
+
+
+def test_merge_results_keeps_distinct_text_at_same_time():
+    results_map = {
+        0: {"error": None, "info_language": "ru", "info_language_probability": 0.9,
+            "segments": [{"start": 1.0, "text": "раз"}]},
+        1: {"error": None, "info_language": "ru", "info_language_probability": 0.9,
+            "segments": [{"start": 1.1, "text": "два"}]},  # близко по времени, но другой текст
+    }
+    segs, _ = Transcriber._merge_results(results_map)
+    assert [s["text"] for s in segs] == ["раз", "два"]
+
+
+# --------------------------------------------------------------------------- #
+#  Сборка результата и рендер Markdown (с метками спикеров)
+# --------------------------------------------------------------------------- #
+def _cpu_transcriber(tmp_path):
+    return Transcriber(tmp_path / "tr", tmp_path / "models", device="cpu")
+
+
+def test_build_result_full_text_has_speaker_prefix(tmp_path):
+    tr = _cpu_transcriber(tmp_path)
+    segments = [
+        {"start": 0.0, "end": 2.0, "text": "Привет", "speaker": "Я"},
+        {"start": 2.0, "end": 4.0, "text": "Здравствуйте", "speaker": "Собеседник"},
+    ]
+    res = tr._build_result(tmp_path / "call.wav", segments, {"language": "ru"}, 4.0)
+    assert "Я: Привет" in res["full_text"]
+    assert "Собеседник: Здравствуйте" in res["full_text"]
+    assert res["mode"] == "accurate"
+    assert res["model"] == "large-v3"
+
+
+def test_render_markdown_contains_header_and_speakers(tmp_path):
+    tr = _cpu_transcriber(tmp_path)
+    result = {
+        "transcribed_at": "2026-05-30T09:20:00",
+        "language": "ru", "language_probability": 0.98,
+        "duration_seconds": 120.0, "model": "large-v3", "mode": "accurate",
+        "segments": [{"start": 0.0, "end": 2.0, "text": "Привет", "speaker": "Я"}],
+    }
+    md = tr._render_markdown(tmp_path / "call.wav", result)
+    assert "# Стенограмма звонка" in md
+    assert "whisper-large-v3" in md
+    assert "Я:" in md and "Привет" in md
+
+
+# --------------------------------------------------------------------------- #
+#  Загрузка каналов из WAV (стерео → 2, моно → 1)
+# --------------------------------------------------------------------------- #
+def test_load_channels_stereo_splits_into_two_speakers(tmp_path):
+    tr = _cpu_transcriber(tmp_path)
+    p = tmp_path / "stereo.wav"
+    save_stereo_wav(p, _speech(0.5, seed=1), _speech(0.5, seed=2))
+    channels, sr = tr._load_channels(p)
+    assert sr == SR
+    assert len(channels) == 2
+    ids = {c[0] for c in channels}
+    assert ids == {"mic", "loopback"}
+    labels = {c[1] for c in channels}
+    assert "Я" in labels and "Собеседник" in labels
+
+
+def test_load_channels_mono_single_channel(tmp_path):
+    tr = _cpu_transcriber(tmp_path)
+    p = tmp_path / "mono.wav"
+    save_wav(p, _speech(0.5, seed=4))
+    channels, sr = tr._load_channels(p)
+    assert len(channels) == 1
+    assert channels[0][1] is None   # нет разделения спикеров для моно

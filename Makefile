@@ -7,7 +7,7 @@ HOST ?= 127.0.0.1
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install install-gpu setup ui ui-lan run record last transcribe clean
+.PHONY: help install install-gpu setup ui ui-lan run record last transcribe test clean
 
 help:  ## Показать список команд
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -43,6 +43,9 @@ last:  ## Обработать последнюю запись
 transcribe:  ## Транскрибировать файл: make transcribe FILE=call.mp4
 	@test -n "$(FILE)" || { echo "Укажи файл: make transcribe FILE=путь"; exit 1; }
 	$(PY) main.py transcribe "$(FILE)"
+
+test:  ## Прогнать тесты (pytest)
+	uv run pytest
 
 clean:  ## Удалить кэш Python
 	find . -type d -name __pycache__ -prune -exec rm -rf {} + ; \
