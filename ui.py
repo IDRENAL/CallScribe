@@ -256,7 +256,8 @@ def _do_transcribe_path(src: Path, device: str | None = None):
                      vad=cfg.get("vad", True),
                      speaker_labels=cfg.get("speaker_labels"),
                      device=device or cfg.get("device", "auto"))
-    tr.transcribe(src)
+    tr.transcribe(src, progress=lambda pct: manager.broadcast_sync(
+        {"type": "job_progress", "pct": pct}))
     md = paths["transcripts"] / f"{src.stem}_transcript.md"
     manager.broadcast_sync({
         "type": "job_done", "label": "Транскрипция готова",

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import os
 import tempfile
 import wave
@@ -214,11 +215,13 @@ def _transcribe_chunk(args: tuple) -> dict:
                 "segments": [], "error": str(e)}
 
 
-def _transcribe_channel(args: tuple) -> dict:
+def _transcribe_channel(args: tuple, progress_cb=None) -> dict:  # noqa: ANN001
     """Воркер режима точности: один проход по куску канала (нарезка по паузам).
 
-    Запускается в отдельном процессе. offset_sec прибавляется к таймстампам,
-    сегментам проставляется speaker. Куски режутся по тишине, слова не теряются.
+    offset_sec прибавляется к таймстампам, сегментам проставляется speaker.
+    progress_cb(frac 0..1) вызывается по ходу прохода — задействуется при запуске
+    в основном процессе (GPU); в дочерних процессах (CPU) недоступен, там прогресс
+    отслеживается по готовности чанков.
     """
     (channel, speaker, wav_path, offset_sec, chunk_dur, model_size, language, device,
      compute_type, models_dir, cpu_threads, vad) = args
@@ -239,18 +242,21 @@ def _transcribe_channel(args: tuple) -> dict:
             wav_path, language=language,
             vad_filter=vad, vad_parameters=ACCURATE_VAD_PARAMS, **ACCURATE_OPTS)
 
-        # Стриминг прогресса для длинных кусков (один проход на GPU был «слепым»)
         segments = []
         last_pct = -10
         for seg in segments_gen:
             segments.append(
                 {"start": seg.start + offset_sec, "end": seg.end + offset_sec,
                  "text": seg.text.strip(), "speaker": speaker, "channel": channel})
-            if chunk_dur > 120:
-                pct = min(99, int(seg.end / chunk_dur * 100))
-                if pct >= last_pct + 5:
+            if chunk_dur > 30:
+                frac = min(0.99, seg.end / chunk_dur)
+                pct = int(frac * 100)
+                if pct >= last_pct + 2:
                     last_pct = pct
-                    print(f"  {channel}: {pct}% ({len(segments)} сегм.)", flush=True)
+                    if progress_cb:
+                        progress_cb(frac)
+                    else:
+                        print(f"  {channel}: {pct}% ({len(segments)} сегм.)", flush=True)
 
         return {"channel": channel, "segments": segments,
                 "info_language": info.language,
@@ -281,8 +287,11 @@ class Transcriber:
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
 
     # -- публичный API ----------------------------------------------------- #
-    def transcribe(self, src_path: str | Path) -> dict:
+    def transcribe(self, src_path: str | Path, progress=None) -> dict:  # noqa: ANN001
+        """progress(pct:int) — опциональный колбэк прогресса (0..100)."""
         src_path = Path(src_path)
+        self._progress = progress or (lambda pct: None)
+        self._last_pct = -1
         print(f"✓ Режим: {self.mode} | модель: {self.model_name} | "
               f"устройство: {self.device}/{self.compute_type}")
 
@@ -297,6 +306,12 @@ class Transcriber:
         result = self._build_result(src_path, segments, info, duration_sec)
         self._write_outputs(src_path, result)
         return result
+
+    def _emit_progress(self, frac: float) -> None:
+        pct = max(0, min(100, int(frac * 100)))
+        if pct != self._last_pct:
+            self._last_pct = pct
+            self._progress(pct)
 
     def _load_channels(self, src_path: Path) -> tuple[list[tuple], int]:
         """Загрузить источник в список каналов (channel_id, speaker, int16 audio).
@@ -352,18 +367,28 @@ class Transcriber:
 
             results = []
             done = 0
+            total = len(specs)
             if self.device == "cuda":
-                for a in args_list:
-                    results.append(_transcribe_channel(a))
+                # В основном процессе: прогресс внутри прохода (intra-chunk)
+                for i, a in enumerate(args_list):
+                    cb = lambda frac, i=i: self._emit_progress((i + frac) / total)
+                    results.append(_transcribe_channel(a, progress_cb=cb))
                     done += 1
-                    self._log_chunk(results[-1], done, len(specs))
+                    self._emit_progress(done / total)
+                    self._log_chunk(results[-1], done, total)
             else:
-                with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                # CPU: чанки в дочерних процессах — прогресс по их готовности.
+                # spawn (а не fork) — чтобы дочерний процесс стартовал «с чистого
+                # листа»: после GPU-задачи в этом же процессе уже подгружен CUDA,
+                # и fork от него ломает пул (BrokenProcessPool).
+                ctx = mp.get_context("spawn")
+                with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
                     futures = [ex.submit(_transcribe_channel, a) for a in args_list]
                     for fut in as_completed(futures):
                         results.append(fut.result())
                         done += 1
-                        self._log_chunk(results[-1], done, len(specs))
+                        self._emit_progress(done / total)
+                        self._log_chunk(results[-1], done, total)
 
         return self._merge_channels(results)
 
@@ -435,7 +460,8 @@ class Transcriber:
             task_args = self._slice_wav(wav_path, n_frames, sample_rate, n_chunks,
                                         threads_per_worker, Path(tmp))
             results_map: dict[int, dict] = {}
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            ctx = mp.get_context("spawn")  # см. accurate: fork после CUDA ломает пул
+            with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
                 futures = {executor.submit(_transcribe_chunk, a): a[0] for a in task_args}
                 for future in as_completed(futures):
                     idx = futures[future]
