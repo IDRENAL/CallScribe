@@ -255,7 +255,8 @@ def _do_transcribe_path(src: Path, device: str | None = None):
                      compute_type=cfg.get("compute_type"),
                      vad=cfg.get("vad", True),
                      speaker_labels=cfg.get("speaker_labels"),
-                     device=device or cfg.get("device", "auto"))
+                     device=device or cfg.get("device", "auto"),
+                     cpu_workers=cfg.get("cpu_workers"))
     tr.transcribe(src, progress=lambda pct: manager.broadcast_sync(
         {"type": "job_progress", "pct": pct}))
     md = paths["transcripts"] / f"{src.stem}_transcript.md"

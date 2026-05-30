@@ -116,6 +116,36 @@ def get_physical_cores() -> int:
     return max(1, cores or 2)
 
 
+# Пик ОЗУ на один CPU-воркер large-v3 (int8) с beam_size=10 — модель + буферы луча.
+# Запас под ОС/браузер/IDE, чтобы система не ушла в swap-thrashing и не зависла.
+PER_WORKER_GB = 3.5
+RAM_RESERVE_GB = 6.0
+
+
+def plan_cpu_workers(n_tasks: int, override: int | None = None) -> tuple[int, int]:
+    """Сколько CPU-воркеров безопасно запустить и сколько потоков дать каждому.
+
+    Лимит — это МИНИМУМ из трёх: число задач, ядра//2 и (свободная ОЗУ − запас)//
+    размер_воркера. Последнее — главная защита: каждый воркер грузит свою копию
+    large-v3 (~3.5 GB), без учёта ОЗУ 6 копий на 31 GB вешают систему намертво.
+    override (config cpu_workers) задаёт жёсткий потолок, но память всё равно учтена.
+    """
+    import psutil
+    phys = get_physical_cores()
+    core_cap = max(1, phys // 2)
+    avail_gb = psutil.virtual_memory().available / 1024 ** 3
+    ram_cap = max(1, int((avail_gb - RAM_RESERVE_GB) / PER_WORKER_GB))
+    n = min(n_tasks, core_cap, ram_cap)
+    if override:
+        n = min(n, max(1, int(override)))
+    n = max(1, n)
+    cpu_threads = max(1, phys // n)
+    if ram_cap < core_cap:
+        print(f"⚠ ОЗУ-лимит: свободно {avail_gb:.1f} GB → не более {ram_cap} воркеров "
+              f"(иначе риск зависания); ядра позволяли {core_cap}")
+    return n, cpu_threads
+
+
 # --------------------------------------------------------------------------- #
 #  Форматирование
 # --------------------------------------------------------------------------- #
@@ -274,12 +304,13 @@ class Transcriber:
                  language: str = "ru", model_name: str | None = None,
                  mode: str = "accurate", compute_type: str | None = None,
                  vad: bool = True, speaker_labels: dict | None = None,
-                 device: str = "auto"):
+                 device: str = "auto", cpu_workers: int | None = None):
         self.transcripts_dir = Path(transcripts_dir)
         self.models_dir = str(models_dir)
         self.language = language
         self.mode = mode
         self.vad = vad
+        self.cpu_workers = cpu_workers  # None → авто (по ядрам и ОЗУ)
         self.speaker_labels = speaker_labels or {"mic": "Я", "loopback": "Собеседник"}
         self.device, auto_compute = detect_compute(device)
         self.compute_type = compute_type or auto_compute  # явный из конфига имеет приоритет
@@ -347,9 +378,10 @@ class Transcriber:
             for s, e in ranges:
                 specs.append((channel, speaker, audio[s:e], s / sr))
 
-        phys = get_physical_cores()
-        n_workers = max(1, min(len(specs), max(1, phys // 2)))
-        cpu_threads = max(1, phys // n_workers)
+        if self.device == "cuda":
+            n_workers, cpu_threads = 1, get_physical_cores()
+        else:
+            n_workers, cpu_threads = plan_cpu_workers(len(specs), self.cpu_workers)
         print(f"✓ Каналов: {len(channels_list)} | чанков по паузам: {len(specs)} | "
               f"воркеров: {n_workers} | потоков/воркер: {cpu_threads} | "
               f"VAD: {'вкл' if self.vad else 'выкл'}")
@@ -448,11 +480,11 @@ class Transcriber:
     def _transcribe_parallel(self, wav_path: Path, n_frames: int,
                              sample_rate: int) -> tuple[list[dict], dict]:
         phys_cores = get_physical_cores()
-        n_workers = max(1, min(phys_cores // 2, 8))
-        threads_per_worker = max(1, phys_cores // n_workers)
-
         duration_sec = n_frames / sample_rate
-        n_chunks = min(n_workers, max(1, int(duration_sec // MIN_CHUNK_SEC)))
+        max_by_duration = max(1, int(duration_sec // MIN_CHUNK_SEC))
+        n_workers, threads_per_worker = plan_cpu_workers(
+            min(max_by_duration, 8), self.cpu_workers)
+        n_chunks = n_workers
         print(f"✓ Ядер: {phys_cores} | воркеров: {n_workers} | "
               f"потоков/воркер: {threads_per_worker} | чанков: {n_chunks}")
 

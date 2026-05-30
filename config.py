@@ -19,6 +19,7 @@ DEFAULT_CONFIG: dict = {
     "device": "auto",       # "auto" (GPU если есть) | "cpu" | "cuda"
     "compute_type": None,   # None → авто; "float32"/"float16"/"int8"
     "vad": True,            # мягкий VAD (не режет тихую речь)
+    "cpu_workers": None,    # None → авто (по ядрам И свободной ОЗУ); число → жёсткий лимит
     "speaker_labels": {"mic": "Я", "loopback": "Собеседник"},
     "output": {
         "recordings": "recordings",

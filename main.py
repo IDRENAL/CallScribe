@@ -49,7 +49,8 @@ def _transcribe_path(cfg: dict, wav_path: Path, device: str | None = None) -> No
                      compute_type=cfg.get("compute_type"),
                      vad=cfg.get("vad", True),
                      speaker_labels=cfg.get("speaker_labels"),
-                     device=device or cfg.get("device", "auto"))
+                     device=device or cfg.get("device", "auto"),
+                     cpu_workers=cfg.get("cpu_workers"))
     tr.transcribe(wav_path)
 
 
