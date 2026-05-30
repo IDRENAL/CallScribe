@@ -18,9 +18,10 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from config import get_paths, load_config
+from exporter import build_export
 from recorder import CallRecorder
 from summarizer import Summarizer, SummarizerError
 from transcriber import Transcriber, cuda_available
@@ -373,6 +374,21 @@ async def api_upload(file: UploadFile = File(...), device: str = Form("auto")):
 
     manager.broadcast_sync({"type": "files", "files": _list_files()})
     return _run_job(f"Обработка {name}…", lambda: _do_transcribe_path(dest, device))
+
+
+@app.get("/api/export")
+async def api_export(stem: str):
+    """Собрать и отдать <stem>.docx (стенограмма + выжимка) на скачивание."""
+    cfg, paths = _config_and_paths()
+    try:
+        out = build_export(stem, paths["transcripts"])
+    except FileNotFoundError:
+        return JSONResponse({"ok": False, "reason": "no_transcript"}, status_code=404)
+    print(f"✓ Экспорт DOCX: {out.name}")
+    return FileResponse(
+        out, filename=out.name,
+        media_type="application/vnd.openxmlformats-officedocument."
+                   "wordprocessingml.document")
 
 
 @app.post("/api/open")

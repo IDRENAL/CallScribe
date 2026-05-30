@@ -96,6 +96,19 @@ def cmd_summarize(args) -> None:
     print(f"✓ Выжимка: {out.name}")
 
 
+def cmd_export(args) -> None:
+    cfg = _require_config()
+    paths = get_paths(cfg)
+    stem = Path(args.stem).stem.replace("_transcript", "")
+    from exporter import build_export
+    try:
+        out = build_export(stem, paths["transcripts"])
+    except FileNotFoundError as e:
+        print(f"✗ {e}")
+        sys.exit(1)
+    print(f"✓ DOCX: {out}")
+
+
 def cmd_last(args) -> None:
     cfg = _require_config()
     paths = get_paths(cfg)
@@ -139,6 +152,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_sum = sub.add_parser("summarize", help="LLM-выжимка из готовой стенограммы")
     p_sum.add_argument("stem", help="stem записи или путь к *_transcript.json")
     p_sum.set_defaults(func=cmd_summarize)
+
+    p_exp = sub.add_parser("export", help="экспорт стенограммы (+выжимки) в .docx")
+    p_exp.add_argument("stem", help="stem записи или путь к *_transcript.json")
+    p_exp.set_defaults(func=cmd_export)
     sub.add_parser("setup", help="мастер настройки").set_defaults(func=cmd_setup)
     return p
 

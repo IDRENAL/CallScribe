@@ -144,6 +144,7 @@
         <div class="action-bar" id="transcriptActions" style="display:none">
           <button onclick="openFile('transcript')">Открыть в редакторе</button>
           <button onclick="summarizeOne()">Сделать выжимку</button>
+          <button onclick="exportDocx()">Экспорт в DOCX</button>
         </div>
       </div>
       <div class="panel" id="panel-summary">
@@ -317,6 +318,9 @@ async function processAll(){if(!selectedStem)return;
 async function summarizeOne(){if(!selectedStem)return;
   const j=await post('/api/summarize',{stem:selectedStem});
   if(!j.ok)appendLog('✗ '+(j.reason||'ошибка'),'err');}
+function exportDocx(){if(!selectedStem)return;
+  appendLog('› Экспорт в DOCX…','info');
+  window.location='/api/export?stem='+encodeURIComponent(selectedStem);}
 async function openFile(type){const path=lastFile[type];if(!path)return;
   await post('/api/open',{path});}
 async function refreshFiles(){const r=await fetch('/api/files');renderFiles(await r.json());}
