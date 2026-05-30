@@ -7,7 +7,7 @@ HOST ?= 127.0.0.1
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install install-gpu setup ui ui-lan run record last transcribe test dist clean
+.PHONY: help install install-gpu setup start ui ui-lan run record last transcribe test dist clean
 
 help:  ## Показать список команд
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -22,7 +22,10 @@ install-gpu:  ## Установить зависимости + CUDA-библио
 setup:  ## Мастер настройки аудио-устройств → config.json
 	$(PY) main.py setup
 
-ui:  ## Запустить веб-интерфейс (HOST/PORT, по умолчанию 127.0.0.1:5000)
+start:  ## ⭐ Запуск всего одной командой: Ollama + веб-интерфейс
+	@./start.sh --host $(HOST) --port $(PORT)
+
+ui:  ## Запустить только веб-интерфейс (HOST/PORT, по умолчанию 127.0.0.1:5000)
 	$(PY) main.py ui --host $(HOST) --port $(PORT)
 
 ui-lan:  ## UI, доступный по сети (для записи с ноутбука → GPU-десктоп)
