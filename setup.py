@@ -80,7 +80,7 @@ def run_setup() -> None:
         import sounddevice  # noqa: F401
     except Exception as e:  # noqa: BLE001
         print(f"✗ sounddevice недоступен: {e}")
-        print("  Установи зависимости: pip install -r requirements.txt")
+        print("  Установи зависимости: uv sync")
         sys.exit(1)
 
     print("=== CallScribe — настройка ===")

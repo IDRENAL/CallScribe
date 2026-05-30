@@ -47,14 +47,12 @@ Windows 10/11 и Linux (Ubuntu 22.04+/Debian 12+).
 Требуется **Python 3.12+**.
 
 ```bash
-# с uv (рекомендуется)
 uv sync
-
-# или через pip
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
 ```
+
+(Зависимости описаны в `pyproject.toml`, точные версии — в `uv.lock`.
+Если [uv](https://docs.astral.sh/uv/) ещё не установлен:
+`curl -LsSf https://astral.sh/uv/install.sh | sh`.)
 
 ### Системная зависимость: PortAudio (нужна только для записи)
 
@@ -276,7 +274,7 @@ make dist           # callscribe.zip — только исходники (чер
 
 ```bash
 unzip callscribe.zip && cd callscribe
-uv sync                # или: pip install -r requirements.txt
+uv sync
 uv run python main.py setup   # настроить аудио-устройства
 uv run python main.py ui
 ```
