@@ -22,6 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import get_paths, load_config
 from recorder import CallRecorder
+from summarizer import Summarizer, SummarizerError
 from transcriber import Transcriber, cuda_available
 
 BASE = Path(__file__).parent
@@ -273,6 +274,46 @@ def _do_transcribe(stem: str, device: str | None = None):
     _do_transcribe_path(src, device)
 
 
+def _do_summarize(stem: str):
+    """Сделать выжимку из готовой стенограммы (без повторной транскрипции)."""
+    cfg, paths = _config_and_paths()
+    scfg = cfg.get("summary", {})
+    if not scfg.get("enabled", True) or scfg.get("provider") == "none":
+        print("⚠ Выжимка отключена в config.summary")
+        return
+    json_path = paths["transcripts"] / f"{stem}_transcript.json"
+    if not json_path.exists():
+        raise FileNotFoundError(f"Нет стенограммы для выжимки: {stem}")
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+
+    sm = Summarizer(provider=scfg.get("provider", "ollama"),
+                    model=scfg.get("model", "qwen2.5:7b"),
+                    host=scfg.get("host", "http://localhost:11434"),
+                    language=scfg.get("language", "ru"),
+                    num_ctx=scfg.get("num_ctx", 8192),
+                    api_key=scfg.get("api_key"),
+                    progress=lambda pct: manager.broadcast_sync(
+                        {"type": "job_progress", "pct": pct}))
+    print(f"✓ Выжимка: {sm.provider}/{sm.model}…")
+    meta = {"source_file": Path(data.get("source_file", stem)).name,
+            "date": data.get("transcribed_at", "").replace("T", " ")[:16],
+            "duration_min": (data.get("duration_seconds") or 0) / 60}
+    summary_md = sm.summarize(data.get("full_text", ""), meta)
+
+    md_path = paths["transcripts"] / f"{stem}_summary.md"
+    md_path.write_text(summary_md, encoding="utf-8")
+    print(f"✓ Выжимка готова: {md_path.name}")
+    manager.broadcast_sync({
+        "type": "job_done", "label": "Выжимка готова",
+        "content": summary_md, "content_type": "summary", "file_path": str(md_path)})
+
+
+def _do_process(stem: str, device: str | None = None):
+    """Полная обработка: транскрипция + выжимка."""
+    _do_transcribe(stem, device)
+    _do_summarize(stem)
+
+
 @app.get("/api/info")
 async def api_info():
     cfg, _ = _config_and_paths()
@@ -291,12 +332,21 @@ async def api_transcribe(body: dict):
 
 @app.post("/api/process")
 async def api_process(body: dict):
-    # v1.0: process == transcribe (выжимка/LLM — v2.0, см. план)
+    # Полная обработка: транскрипция + LLM-выжимка
     stem = body.get("stem")
     if not stem:
         return JSONResponse({"ok": False, "reason": "no_stem"})
     device = body.get("device")
-    return _run_job("Обработка…", lambda: _do_transcribe(stem, device))
+    return _run_job("Обработка…", lambda: _do_process(stem, device))
+
+
+@app.post("/api/summarize")
+async def api_summarize(body: dict):
+    # Выжимка из уже готовой стенограммы (без повторной транскрипции)
+    stem = body.get("stem")
+    if not stem:
+        return JSONResponse({"ok": False, "reason": "no_stem"})
+    return _run_job("Выжимка…", lambda: _do_summarize(stem))
 
 
 def _safe_name(filename: str) -> str:

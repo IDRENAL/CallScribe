@@ -21,6 +21,15 @@ DEFAULT_CONFIG: dict = {
     "vad": True,            # мягкий VAD (не режет тихую речь)
     "cpu_workers": None,    # None → авто (по ядрам И свободной ОЗУ); число → жёсткий лимит
     "speaker_labels": {"mic": "Я", "loopback": "Собеседник"},
+    "summary": {                       # v2.0: выжимка через LLM (local-first)
+        "enabled": True,
+        "provider": "ollama",          # "ollama" (локально) | "openai" | "none"
+        "model": "qwen2.5:7b",
+        "host": "http://localhost:11434",
+        "num_ctx": 8192,
+        "api_key": None,               # нужен только для provider=openai
+        "language": "ru",
+    },
     "output": {
         "recordings": "recordings",
         "transcripts": "transcripts",
@@ -37,7 +46,9 @@ def load_config() -> dict:
     # Дополнить недостающие ключи дефолтами
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
     merged.update(cfg)
+    # вложенные блоки сливаем поключно, чтобы частичный конфиг не затирал дефолты
     merged["output"] = {**DEFAULT_CONFIG["output"], **cfg.get("output", {})}
+    merged["summary"] = {**DEFAULT_CONFIG["summary"], **cfg.get("summary", {})}
     return merged
 
 

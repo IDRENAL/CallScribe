@@ -69,6 +69,33 @@ def cmd_run(args) -> None:
     _transcribe_path(cfg, wav, getattr(args, "device", None))
 
 
+def cmd_summarize(args) -> None:
+    cfg = _require_config()
+    paths = get_paths(cfg)
+    stem = Path(args.stem).stem.replace("_transcript", "")
+    json_path = paths["transcripts"] / f"{stem}_transcript.json"
+    if not json_path.exists():
+        print(f"✗ Нет стенограммы: {json_path.name} (сначала transcribe)")
+        sys.exit(1)
+    import json as _json
+    from summarizer import Summarizer
+    scfg = cfg.get("summary", {})
+    data = _json.loads(json_path.read_text(encoding="utf-8"))
+    sm = Summarizer(provider=scfg.get("provider", "ollama"),
+                    model=scfg.get("model", "qwen2.5:7b"),
+                    host=scfg.get("host", "http://localhost:11434"),
+                    language=scfg.get("language", "ru"),
+                    num_ctx=scfg.get("num_ctx", 8192),
+                    api_key=scfg.get("api_key"))
+    meta = {"source_file": Path(data.get("source_file", stem)).name,
+            "date": data.get("transcribed_at", "").replace("T", " ")[:16],
+            "duration_min": (data.get("duration_seconds") or 0) / 60}
+    md = sm.summarize(data.get("full_text", ""), meta)
+    out = paths["transcripts"] / f"{stem}_summary.md"
+    out.write_text(md, encoding="utf-8")
+    print(f"✓ Выжимка: {out.name}")
+
+
 def cmd_last(args) -> None:
     cfg = _require_config()
     paths = get_paths(cfg)
@@ -108,6 +135,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_last = sub.add_parser("last", help="обработать последний WAV")
     p_last.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
     p_last.set_defaults(func=cmd_last)
+
+    p_sum = sub.add_parser("summarize", help="LLM-выжимка из готовой стенограммы")
+    p_sum.add_argument("stem", help="stem записи или путь к *_transcript.json")
+    p_sum.set_defaults(func=cmd_summarize)
     sub.add_parser("setup", help="мастер настройки").set_defaults(func=cmd_setup)
     return p
 

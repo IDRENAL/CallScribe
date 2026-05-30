@@ -143,10 +143,14 @@
         <div class="viewer" id="transcriptView"><div class="empty">выбери запись со стенограммой</div></div>
         <div class="action-bar" id="transcriptActions" style="display:none">
           <button onclick="openFile('transcript')">Открыть в редакторе</button>
+          <button onclick="summarizeOne()">Сделать выжимку</button>
         </div>
       </div>
       <div class="panel" id="panel-summary">
-        <div class="viewer" id="summaryView"><div class="empty">выжимка появится в v2.0</div></div>
+        <div class="viewer" id="summaryView"><div class="empty">выбери запись и нажми «Сделать выжимку»</div></div>
+        <div class="action-bar" id="summaryActions" style="display:none">
+          <button onclick="openFile('summary')">Открыть в редакторе</button>
+        </div>
       </div>
     </div>
   </main>
@@ -227,6 +231,10 @@ function onJobDone(msg){
     lastFile.transcript=msg.file_path;
     renderViewer('transcript',msg.content);
     switchTab('transcript');
+  }else if(msg.content_type==='summary'){
+    lastFile.summary=msg.file_path;
+    renderViewer('summary',msg.content);
+    switchTab('summary');
   }
   refreshFiles();
 }
@@ -265,11 +273,11 @@ async function loadContent(type){
 }
 function renderViewer(type,content){
   const view=document.getElementById(type==='transcript'?'transcriptView':'summaryView');
-  const actions=document.getElementById('transcriptActions');
+  const bar=document.getElementById(type==='transcript'?'transcriptActions':'summaryActions');
   if(!content){view.innerHTML='<div class="empty">нет данных</div>';
-    if(type==='transcript')actions.style.display='none';return;}
+    if(bar)bar.style.display='none';return;}
   view.innerHTML=mdToHtml(content);
-  if(type==='transcript')actions.style.display='flex';
+  if(bar)bar.style.display='flex';
 }
 
 function mdToHtml(md){
@@ -305,6 +313,9 @@ async function transcribe(){if(!selectedStem)return;
   if(!j.ok)appendLog('✗ '+(j.reason||'ошибка'),'err');}
 async function processAll(){if(!selectedStem)return;
   const j=await post('/api/process',{stem:selectedStem,device:getDevice()});
+  if(!j.ok)appendLog('✗ '+(j.reason||'ошибка'),'err');}
+async function summarizeOne(){if(!selectedStem)return;
+  const j=await post('/api/summarize',{stem:selectedStem});
   if(!j.ok)appendLog('✗ '+(j.reason||'ошибка'),'err');}
 async function openFile(type){const path=lastFile[type];if(!path)return;
   await post('/api/open',{path});}
