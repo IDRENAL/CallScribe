@@ -341,6 +341,12 @@ class Transcriber:
         channels_list, sr = self._load_channels(src_path)
         duration_sec = max((len(a) for _, _, a in channels_list), default=0) / sr
 
+        # Грубая оценка времени: GPU ~x0.3 от длительности, CPU ~x3.
+        eta_min = duration_sec / 60 * (0.3 if self.device == "cuda" else 3.0)
+        print(f"✓ Длительность: {duration_sec / 60:.1f} мин | ориентир обработки: "
+              f"~{eta_min:.0f} мин на {self.device.upper()}. Идёт обработка…",
+              flush=True)
+
         if self.mode == "accurate":
             segments, info = self._transcribe_accurate(channels_list, sr)
         else:
@@ -498,7 +504,19 @@ class Transcriber:
                             self._emit_progress(done / total)
                             self._log_chunk(results[-1], done, total)
 
+        self._fail_if_all_errored(results)
         return self._merge_channels(results)
+
+    @staticmethod
+    def _fail_if_all_errored(results: list[dict]) -> None:
+        """Если ни один чанк не дал текста, но были ошибки — это провал, не «успех».
+
+        Иначе пустая стенограмма записалась бы как готовая (типичный случай —
+        пропавшие CUDA-библиотеки на GPU).
+        """
+        errors = [r["error"] for r in results if r.get("error")]
+        if errors and not any(r["segments"] for r in results):
+            raise RuntimeError(f"Транскрипция не удалась: {errors[0]}")
 
     @staticmethod
     def _log_chunk(res: dict, done: int, total: int) -> None:
@@ -591,6 +609,7 @@ class Transcriber:
                             print(f"✓ Чанк {idx + 1}/{n_chunks} готов "
                                   f"({len(res['segments'])} сегм.)")
 
+        self._fail_if_all_errored(list(results_map.values()))
         return self._merge_results(results_map)
 
     def _slice_wav(self, wav_path: Path, n_frames: int, sample_rate: int,

@@ -1,7 +1,10 @@
 # CallScribe — удобные команды запуска.
 # Использование: make <цель>. Например: make ui  |  make transcribe FILE=call.mp4
 
-PY   ?= uv run python
+# --no-sync: не пересинхронизировать окружение при каждом запуске, иначе
+# опциональный extra `gpu` (CUDA-либы) срезается и GPU-транскрипция ломается.
+# Синхронизацию делай явно: make install (CPU) или make install-gpu (NVIDIA).
+PY   ?= uv run --no-sync python
 PORT ?= 5000
 HOST ?= 127.0.0.1
 

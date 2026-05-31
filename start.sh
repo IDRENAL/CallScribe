@@ -30,6 +30,18 @@ else
   echo "⚠ Ollama не запущен — выжимка будет недоступна (транскрипция работает)"
 fi
 
-# 2) Веб-интерфейс (сам откроет браузер).
+# 2) Синхронизация окружения. ВАЖНО: при наличии NVIDIA ставим extra gpu —
+#    иначе CUDA-библиотеки (libcublas/cudnn) не подтянутся и GPU-транскрипция
+#    молча выдаст пустой результат. Дальше запускаем с --no-sync, чтобы
+#    повторный авто-sync от `uv run` не срезал эти либы.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  echo "▶ Синхронизирую окружение (с GPU)…"
+  uv sync --extra gpu
+else
+  echo "▶ Синхронизирую окружение…"
+  uv sync
+fi
+
+# 3) Веб-интерфейс (сам откроет браузер).
 echo "▶ Запускаю веб-интерфейс…"
-exec uv run python main.py ui "$@"
+exec uv run --no-sync python main.py ui "$@"

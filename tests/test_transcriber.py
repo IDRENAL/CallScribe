@@ -124,6 +124,33 @@ def test_choose_model_always_large():
 # --------------------------------------------------------------------------- #
 #  Склейка каналов и дедупликация
 # --------------------------------------------------------------------------- #
+def test_fail_if_all_errored_raises_when_no_segments():
+    # Все чанки упали (типичный случай — пропавшие CUDA-либы): должно бросить,
+    # а не записать пустую стенограмму как «успех».
+    results = [
+        {"channel": "mic", "error": "libcublas.so.12 not found", "segments": []},
+        {"channel": "loopback", "error": "libcublas.so.12 not found", "segments": []},
+    ]
+    with pytest.raises(RuntimeError, match="libcublas"):
+        Transcriber._fail_if_all_errored(results)
+
+
+def test_fail_if_all_errored_silent_on_partial_success():
+    # Часть чанков с текстом — это не провал, ошибку отдельного чанка терпим.
+    results = [
+        {"channel": "mic", "error": "сбой одного чанка", "segments": []},
+        {"channel": "loopback", "error": None,
+         "segments": [{"start": 0.0, "text": "привет"}]},
+    ]
+    Transcriber._fail_if_all_errored(results)  # не бросает
+
+
+def test_fail_if_all_errored_silent_on_clean_empty():
+    # Тишина без ошибок — легитимный пустой результат, не провал.
+    results = [{"channel": "mic", "error": None, "segments": []}]
+    Transcriber._fail_if_all_errored(results)  # не бросает
+
+
 def test_merge_channels_sorts_by_time_and_keeps_language():
     results = [
         {"channel": "mic", "error": None, "info_language": "ru",
